@@ -210,6 +210,8 @@ BUILD_DIR="$REPO_DIR/build"
 BUILD_SAVE_FILE="$REPO_DIR/buildsaves.cfg"   # NEW: persistent build configurations
 BUILD_INFO_FILE=false           # Changed from implicit true to false
 FORCE_UPDATE=false              # NEW: skip interactive menu and force update
+FORCE_REMOVE=false              # NEW: skip interactive menu and force remove
+FORCE_REMOVE_UPDATE=false       # NEW: force remove existing then install fresh
 
 # NEW: List for files/directories manually included from actual filesystem (gitignored files)
 BUILD_INCLUDE_LIST="/tmp/build_include_$$.txt"
@@ -2304,7 +2306,9 @@ show_help() {
     echo "  --no-preserve    Don't preserve files during update"
     echo "  --node           Auto-install Node.js if missing (requires internet)"
     echo "  --nodejs         Same as --node"
-    echo "  --update         Force update without interactive menu"
+    echo "  --update, -u     Force update without interactive menu"
+    echo "  --remove, -r     Force remove existing installation without interactive menu"
+    echo "  --reinstall, -ru Force remove existing then install fresh (remove + update)"
     echo "  --build          Create a build from the last commit"
     echo "  --tar            Create a tar.gz archive (use with --build)"
     echo "  --config         Interactive file exclusion (use with --build)"
@@ -2319,6 +2323,11 @@ show_help() {
     echo "  $0 --build --message          Use commit message for naming"
     echo "  $0 --build mysave             Build using saved configuration 'mysave' (uses saved tar setting)"
     echo "  $0 --build --tar mysave       Build using saved config but force tar.gz output"
+    echo
+    echo "Installation management examples:"
+    echo "  $0 -u                         Force update (no interactive menu)"
+    echo "  $0 -r                         Force remove (no interactive menu)"
+    echo "  $0 -ru                        Force remove then reinstall fresh"
     echo
     echo "Commands will be created for:"
     
@@ -3838,6 +3847,27 @@ perform_update() {
 # END OF UPDATE INSTALLATION FUNCTION
 # =============================================================================
 
+# =============================================================================
+# REMOVE INSTALLATION FUNCTION
+# =============================================================================
+# Handles the removal process: removes command links and deletes the installation
+# directory.
+# =============================================================================
+
+perform_remove() {
+    log_message "Removing $PROJECT_NAME installation..."
+    
+    remove_links
+    rm -rf "$INSTALL_DIR"
+    
+    log_message "$PROJECT_NAME removed successfully!"
+    echo "$PROJECT_NAME has been removed."
+}
+
+# =============================================================================
+# END OF REMOVE INSTALLATION FUNCTION
+# =============================================================================
+
 cleanup() {
     sudo dpkg --configure -a > /dev/null 2>&1 || true
 }
@@ -3865,7 +3895,9 @@ for arg in "$@"; do
         --local-dir) LOCAL_DIR_MODE=true ;;
         --no-preserve) PRESERVE_DATA=false ;;
         --node|--nodejs) INSTALL_NODE=true ;;
-        --update) FORCE_UPDATE=true ;;
+        --update|-u) FORCE_UPDATE=true ;;
+        --remove|-r) FORCE_REMOVE=true ;;
+        --reinstall|-ru) FORCE_REMOVE_UPDATE=true ;;
         --build) BUILD_MODE=true ;;
         --tar) BUILD_TAR=true ;;
         --config) BUILD_CONFIG=true ;;
@@ -3874,7 +3906,7 @@ for arg in "$@"; do
     esac
     # Handle --build with optional save name
     # This catches: ./install.sh --build mysave  OR  ./install.sh --build --tar mysave
-    if [ "$prev_arg" = "--build" ] && [ "$arg" != "--build" ] && [ "$arg" != "--tar" ] && [ "$arg" != "--config" ] && [ "$arg" != "--message" ] && [ "$arg" != "--version" ] && [ "$arg" != "-log" ] && [ "$arg" != "--skip-debs" ] && [ "$arg" != "--local-dir" ] && [ "$arg" != "--no-preserve" ] && [ "$arg" != "--node" ] && [ "$arg" != "--nodejs" ] && [ "$arg" != "--update" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
+    if [ "$prev_arg" = "--build" ] && [ "$arg" != "--build" ] && [ "$arg" != "--tar" ] && [ "$arg" != "--config" ] && [ "$arg" != "--message" ] && [ "$arg" != "--version" ] && [ "$arg" != "-log" ] && [ "$arg" != "--skip-debs" ] && [ "$arg" != "--local-dir" ] && [ "$arg" != "--no-preserve" ] && [ "$arg" != "--node" ] && [ "$arg" != "--nodejs" ] && [ "$arg" != "--update" ] && [ "$arg" != "-u" ] && [ "$arg" != "--remove" ] && [ "$arg" != "-r" ] && [ "$arg" != "--reinstall" ] && [ "$arg" != "-ru" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
         BUILD_SAVE_NAME="$arg"
     fi
     # Handle --version with specific version number
@@ -3918,6 +3950,35 @@ if [ "$BUILD_MODE" = true ]; then
     do_build
 fi
 
+# =========================================================================
+# HANDLE REINSTALL MODE (--reinstall / -ru)
+# This removes the existing installation completely and then performs a fresh install.
+# =========================================================================
+if [ "$FORCE_REMOVE_UPDATE" = true ]; then
+    if [ -d "$INSTALL_DIR" ]; then
+        log_message "--reinstall (-ru) flag detected - removing existing installation completely..."
+        perform_remove
+        log_message "Proceeding with fresh installation..."
+    else
+        log_message "--reinstall (-ru) flag detected but no existing installation found. Proceeding with fresh installation..."
+    fi
+    # Continue to fresh installation (fall through to the main installation logic)
+fi
+
+# =========================================================================
+# HANDLE REMOVE MODE (--remove / -r)
+# This removes the installation and exits without reinstalling.
+# =========================================================================
+if [ "$FORCE_REMOVE" = true ]; then
+    if [ -d "$INSTALL_DIR" ]; then
+        perform_remove
+    else
+        log_message "$PROJECT_NAME is not installed."
+        echo "$PROJECT_NAME is not installed."
+    fi
+    exit 0
+fi
+
 log_message "Starting $PROJECT_NAME installation..."
 
 # Check and install Node.js if --node or --nodejs flag was provided
@@ -3935,7 +3996,7 @@ if [ -d "$INSTALL_DIR" ]; then
     
     if [ "$FORCE_UPDATE" = true ]; then
         # Force update mode - skip interactive menu
-        log_message "--update flag detected, forcing update without interactive menu..."
+        log_message "--update (-u) flag detected, forcing update without interactive menu..."
         perform_update
         # Display final summary and exit
         printf "\n"
@@ -4022,7 +4083,7 @@ if [ -d "$INSTALL_DIR" ]; then
             1)
                 perform_update
                 ;;
-            2) remove_links; rm -rf "$INSTALL_DIR"; exit 0 ;;
+            2) perform_remove; exit 0 ;;
             3) exit 0 ;;
             *) exit 1 ;;
         esac
