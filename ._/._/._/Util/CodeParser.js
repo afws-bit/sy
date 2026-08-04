@@ -1,867 +1,839 @@
-// CodeParser.js
+// codeParser.js — v6.0
+// Parser/filtro estrutural de arquivos JS/TS.
+//
+// Arquitetura (cada camada é independente e testável isoladamente):
+//   Tokenizer      -> transforma o texto em registros de linha (código limpo, spans de
+//                     comentário, profundidade de chaves). Nenhuma decisão semântica.
+//   StructureParser-> constrói a árvore (imports/exports/containers/functions/variables).
+//   Selection      -> normaliza o objeto de seleção (aceita formato legado v5).
+//   CommentStripper-> aplica os modos de remoção de comentário/JSDoc sobre as linhas emitidas.
+//   CodeEmitter    -> monta o código filtrado de forma hierárquica (header + membros + footer),
+//                     que é o que garante saída sem erro de sintaxe.
+//   CodeParser     -> fachada estática (API pública).
+//   CLIMenu        -> interface de linha de comando.
+
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
-class CodeParser {
-    static #parsedTree = null;
-    static #originalCode = '';
-    static #filePath = '';
+/* ============================================================================
+ * CONSTANTES
+ * ========================================================================== */
 
-    static parse(filePath) {
-        const code = fs.readFileSync(filePath, 'utf8');
-        this.#originalCode = code;
-        this.#filePath = filePath;
-        
-        this.#parsedTree = {
-            filePath,
-            imports: [],
-            exports: [],
-            classes: [],
-            functions: [],
-            variables: [],
-            comments: [],
-            jsdoc: [],
-            raw: {
-                lines: code.split('\n'),
-                totalLines: 0,
-                totalChars: code.length
-            }
-        };
+const COMMENT_MODES = ['keep', 'top-level', 'all'];
 
-        this.#breakdownCode(code);
-        return this.#parsedTree;
-    }
+const MODE_LABEL = {
+    'keep': 'KEEP        (mantém todos)',
+    'top-level': 'TOP-LEVEL   (remove só a camada principal)',
+    'all': 'ALL         (remove tudo, inclusive dentro de classes)'
+};
 
-    static getImports() { return this.#parsedTree?.imports || []; }
-    static getExports() { return this.#parsedTree?.exports || []; }
-    
-    static getClasses(options = {}) {
-        let classes = this.#parsedTree?.classes || [];
-        if (options.includeClasses) classes = classes.filter(c => options.includeClasses.includes(c.name));
-        if (options.excludeClasses) classes = classes.filter(c => !options.excludeClasses.includes(c.name));
-        return classes;
-    }
+const OPENERS = '([{';
+const CLOSERS = ')]}';
 
-    static getFunctions(options = {}) {
-        let functions = this.#parsedTree?.functions || [];
-        if (options.includeFunctions) functions = functions.filter(f => options.includeFunctions.includes(f.name));
-        if (options.excludeFunctions) functions = functions.filter(f => !options.excludeFunctions.includes(f.name));
-        return functions;
-    }
+const RE_CONTINUES = /[,+\-*/%&|^~=<>?:.([{!]$/;
+const RE_CONTINUATION_START = /^(?:[.)\]},]|\?\.|&&|\|\||=>|\+|-|\*|\/|:|extends\b|implements\b)/;
+const RE_KEYWORD_BEFORE_REGEX = /\b(return|typeof|instanceof|in|of|new|delete|void|case|do|else|yield|await|throw)$/;
 
-    static getMethods(options = {}) {
-        let methods = [];
-        const classes = this.getClasses(options);
-        
-        for (const cls of classes) {
-            let allItems = [];
-            
-            if (cls.constructor) allItems.push({...cls.constructor, className: cls.name});
-            
-            for (const m of (cls.methods || [])) allItems.push({...m, className: cls.name});
-            for (const m of (cls.staticMethods || [])) allItems.push({...m, className: cls.name});
-            for (const m of (cls.getters || [])) allItems.push({...m, className: cls.name});
-            for (const m of (cls.setters || [])) allItems.push({...m, className: cls.name});
-            for (const m of (cls.constructorProps || [])) allItems.push({...m, className: cls.name});
-            for (const m of (cls.properties || [])) allItems.push({...m, className: cls.name});
-            for (const m of (cls.assignments || [])) allItems.push({...m, className: cls.name});
-            
-            if (options.includeMethods) {
-                allItems = allItems.filter(m => options.includeMethods.includes(m.name));
-            }
-            if (options.excludeMethods) {
-                allItems = allItems.filter(m => !options.excludeMethods.includes(m.name));
-            }
-            
-            methods.push(...allItems);
-        }
-        return methods;
-    }
+/* ============================================================================
+ * 1. TOKENIZER
+ * ========================================================================== */
 
-    static getJSDoc() { return this.#parsedTree?.jsdoc || []; }
-    static getComments() { return this.#parsedTree?.comments || []; }
-    static getVariables() { return this.#parsedTree?.variables || []; }
-    static getTree() { return this.#parsedTree; }
+class Tokenizer {
+    static tokenize(code) {
+        const raw = code.split('\n');
+        const lines = [];
 
-    static generateFiltered(selection = {}) {
-        const lines = this.#originalCode.split('\n');
-        const keepLines = new Set();
-        
-        const addRange = (start, end) => {
-            // Ensure valid numbers and clamp to available lines
-            const s = Math.max(1, Math.min(start, lines.length));
-            const e = Math.max(1, Math.min(end, lines.length));
-            for (let i = s; i <= e; i++) keepLines.add(i);
-        };
-        
-        // Track which lines belong to which selected items
-        // to avoid including lines from excluded items with same name
-        
-        if (selection.includeImports) {
-            for (const imp of this.#parsedTree.imports) {
-                addRange(imp.lineStart, imp.lineEnd);
-            }
-        }
-        
-        if (selection.includeExports) {
-            for (const exp of this.#parsedTree.exports) {
-                keepLines.add(Math.max(1, Math.min(exp.line, lines.length)));
-            }
-        }
-        
-        if (selection.includeClasses?.length > 0) {
-            for (const cls of this.#parsedTree.classes) {
-                if (selection.includeClasses.includes(cls.name)) {
-                    // Always include JSDoc if option is enabled
-                    if (cls.jsdoc && (selection.includeAllJSDoc || selection.includeAllComments)) {
-                        addRange(cls.jsdoc.lineStart, cls.jsdoc.lineEnd);
-                    }
-                    // Always include the full class definition
-                    addRange(cls.lineStart, cls.lineEnd);
-                    
-                    // If specific methods are selected, we keep the whole class
-                    // but mark which method lines to keep (they're already inside class range)
-                    if (selection.includeMethods?.length > 0) {
-                        // The class range already includes all methods
-                        // We just need to ensure the class stays included
-                        // Methods are inside the class range, so they're already kept
-                    }
-                }
-            }
-        }
-        
-        if (selection.includeFunctions?.length > 0) {
-            for (const func of this.#parsedTree.functions) {
-                if (selection.includeFunctions.includes(func.name)) {
-                    if (func.jsdoc && (selection.includeAllJSDoc || selection.includeAllComments)) {
-                        addRange(func.jsdoc.lineStart, func.jsdoc.lineEnd);
-                    }
-                    addRange(func.lineStart, func.lineEnd);
-                }
-            }
-        }
-        
-        if (selection.includeVariables) {
-            for (const v of this.#parsedTree.variables) {
-                keepLines.add(Math.max(1, Math.min(v.line, lines.length)));
-            }
-        }
-        
-        if (selection.includeAllComments) {
-            for (const comment of this.#parsedTree.comments) {
-                if (comment.lineStart && comment.lineEnd) {
-                    addRange(comment.lineStart, comment.lineEnd);
-                } else if (comment.line) {
-                    keepLines.add(Math.max(1, Math.min(comment.line, lines.length)));
-                }
-            }
-        }
-        
-        if (selection.includeAllJSDoc) {
-            for (const jsdoc of this.#parsedTree.jsdoc) {
-                addRange(jsdoc.lineStart, jsdoc.lineEnd);
-            }
-        }
-        
-        // Build result from sorted line numbers
-        const sortedLines = [...keepLines].sort((a, b) => a - b);
-        if (sortedLines.length === 0) return '';
-        
-        let result = '';
-        let lastLine = sortedLines[0] - 1;
-        
-        for (const lineNum of sortedLines) {
-            // Add blank line for gaps between non-consecutive lines
-            if (lineNum > lastLine + 1 && result.length > 0 && !result.endsWith('\n\n')) {
-                result += '\n';
-            }
-            const idx = lineNum - 1;
-            if (idx >= 0 && idx < lines.length) {
-                result += lines[idx] + '\n';
-            }
-            lastLine = lineNum;
-        }
-        
-        return result;
-    }
+        let depth = 0;
+        let inBlock = false;
+        let blockIsDoc = false;
+        let blockDepth = 0;
+        let blockId = 0;
+        let idCounter = 0;
+        let inTemplate = false;
+        let tail = '';
 
-    static #calcCharCount(lineStart, lineEnd) {
-        const lines = this.#originalCode.split('\n');
-        let total = 0;
-        const s = Math.max(0, lineStart - 1);
-        const e = Math.min(lines.length - 1, lineEnd - 1);
-        for (let i = s; i <= e; i++) {
-            total += lines[i].length;
-            if (i < e) total += 1; // newline
-        }
-        return total;
-    }
+        for (let i = 0; i < raw.length; i++) {
+            const original = raw[i];
+            const rec = {
+                num: i + 1,
+                original,
+                clean: '',
+                comments: [],
+                depthStart: depth,
+                hasCode: false,
+                commentOnly: false
+            };
 
-    static #tokenize(lines) {
-        const tokens = [];
-        let inBlockComment = false;
-        
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const lineNum = i + 1;
             let clean = '';
+            let span = null;
             let inString = false;
             let stringChar = '';
-            let inLineComment = false;
+            let inLine = false;
             let j = 0;
-            
-            while (j < line.length) {
-                const ch = line[j];
-                const next = j + 1 < line.length ? line[j + 1] : '';
-                
-                if (inBlockComment) {
+
+            const openSpan = (col, kind, isDoc, d, id) => {
+                span = { start: col, end: original.length, kind, isDoc, depth: d, blockId: id };
+            };
+            const closeSpan = (col) => {
+                if (!span) return;
+                span.end = Math.min(col, original.length);
+                if (span.end > span.start) rec.comments.push(span);
+                span = null;
+            };
+
+            if (inBlock) openSpan(0, 'block', blockIsDoc, blockDepth, blockId);
+
+            while (j < original.length) {
+                const ch = original[j];
+                const next = j + 1 < original.length ? original[j + 1] : '';
+
+                if (inBlock) {
                     if (ch === '*' && next === '/') {
-                        inBlockComment = false;
+                        inBlock = false;
+                        clean += '  ';
                         j += 2;
+                        closeSpan(j);
                         continue;
                     }
+                    clean += ' ';
                     j++;
                     continue;
                 }
-                
-                if (inLineComment) {
-                    j++;
+
+                if (inLine) { clean += ' '; j++; continue; }
+
+                if (inTemplate) {
+                    if (ch === '\\') { clean += '  '; j += 2; continue; }
+                    if (ch === '`') { inTemplate = false; tail = (tail + '_').slice(-24); clean += ' '; j++; continue; }
+                    clean += ' '; j++;
                     continue;
                 }
-                
-                if (!inString) {
-                    if (ch === '/' && next === '/') {
-                        inLineComment = true;
-                        j += 2;
-                        continue;
-                    }
-                    if (ch === '/' && next === '*') {
-                        inBlockComment = true;
-                        j += 2;
+
+                if (inString) {
+                    if (ch === '\\') { clean += '  '; j += 2; continue; }
+                    if (ch === stringChar) { inString = false; tail = (tail + '_').slice(-24); }
+                    clean += ' '; j++;
+                    continue;
+                }
+
+                if (ch === '/' && next === '/') {
+                    inLine = true;
+                    openSpan(j, 'line', false, depth, ++idCounter);
+                    clean += '  ';
+                    j += 2;
+                    continue;
+                }
+
+                if (ch === '/' && next === '*') {
+                    inBlock = true;
+                    blockIsDoc = original[j + 2] === '*';
+                    blockDepth = depth;
+                    blockId = ++idCounter;
+                    openSpan(j, 'block', blockIsDoc, blockDepth, blockId);
+                    clean += '  ';
+                    j += 2;
+                    continue;
+                }
+
+                if (ch === '/' && this.#regexAllowedAfter(tail)) {
+                    const end = this.#findRegexEnd(original, j);
+                    if (end !== -1) {
+                        clean += ' '.repeat(end - j + 1);
+                        tail = (tail + '_').slice(-24);
+                        j = end + 1;
                         continue;
                     }
                 }
-                
-                if (!inString && (ch === '"' || ch === "'" || ch === '`')) {
+
+                if (ch === '"' || ch === "'") {
                     inString = true;
                     stringChar = ch;
                     clean += ' ';
                     j++;
                     continue;
                 }
-                
-                if (inString) {
-                    if (ch === '\\') {
-                        clean += '  ';
-                        j += 2;
-                        continue;
-                    }
-                    if (ch === stringChar) {
-                        inString = false;
-                    }
-                    clean += ' ';
-                    j++;
-                    continue;
-                }
-                
+
+                if (ch === '`') { inTemplate = true; clean += ' '; j++; continue; }
+
+                if (ch === '{') depth++;
+                else if (ch === '}') depth = Math.max(0, depth - 1);
+
                 clean += ch;
+                tail = (tail + ch).slice(-24);
                 j++;
             }
-            
-            tokens.push({
-                lineNum,
-                original: line,
-                clean: clean,
-                trimmed: clean.trim()
-            });
+
+            closeSpan(original.length);
+
+            rec.clean = clean;
+            rec.hasCode = clean.trim().length > 0;
+            rec.commentOnly = !rec.hasCode && rec.comments.length > 0;
+            lines.push(rec);
         }
-        
-        return tokens;
+
+        return lines;
     }
 
-    static #findBlockEnd(tokens, startIdx, maxIdx) {
+    static #regexAllowedAfter(tail) {
+        const t = tail.replace(/\s+$/, '');
+        if (!t) return true;
+        const last = t[t.length - 1];
+        if (last === ')' || last === ']') return false;
+        if (/[\w$]/.test(last)) return RE_KEYWORD_BEFORE_REGEX.test(t);
+        return true;
+    }
+
+    static #findRegexEnd(line, start) {
+        let inClass = false;
+        for (let i = start + 1; i < line.length; i++) {
+            const ch = line[i];
+            if (ch === '\\') { i++; continue; }
+            if (inClass) { if (ch === ']') inClass = false; continue; }
+            if (ch === '[') { inClass = true; continue; }
+            if (ch === '/') return i;
+        }
+        return -1;
+    }
+
+    static collectBlocks(lines) {
+        const byId = new Map();
+        for (const rec of lines) {
+            for (const span of rec.comments) {
+                let entry = byId.get(span.blockId);
+                if (!entry) {
+                    entry = {
+                        type: span.kind,
+                        isDoc: span.isDoc,
+                        depth: span.depth,
+                        lineStart: rec.num,
+                        lineEnd: rec.num,
+                        content: []
+                    };
+                    byId.set(span.blockId, entry);
+                }
+                entry.lineEnd = rec.num;
+                entry.content.push(rec.original.slice(span.start, span.end));
+            }
+        }
+        return [...byId.values()].map(e => ({ ...e, content: e.content.join('\n') }));
+    }
+}
+
+/* ============================================================================
+ * 2. UTILITÁRIOS DE VARREDURA
+ * ========================================================================== */
+
+class Scanner {
+    static findBlockEnd(lines, startIdx, startCol, maxIdx) {
         let depth = 0;
         let started = false;
-        
-        for (let i = startIdx; i <= maxIdx; i++) {
-            const line = tokens[i].clean;
-            for (let j = 0; j < line.length; j++) {
-                if (line[j] === '{') {
-                    depth++;
-                    started = true;
-                } else if (line[j] === '}') {
+
+        for (let i = startIdx; i <= maxIdx && i < lines.length; i++) {
+            const text = lines[i].clean;
+            const from = i === startIdx ? startCol : 0;
+            for (let j = from; j < text.length; j++) {
+                const ch = text[j];
+                if (ch === '{') { depth++; started = true; }
+                else if (ch === '}') {
                     depth--;
-                    if (started && depth === 0) return i;
+                    if (started && depth === 0) return { idx: i, col: j };
                 }
             }
         }
-        return maxIdx;
+        return { idx: Math.min(maxIdx, lines.length - 1), col: -1 };
     }
 
-    static #extractName(clean) {
-        const words = clean.match(/[a-zA-Z_$][a-zA-Z0-9_$]*/g);
-        return words || [];
-    }
+    static findBodyStart(lines, startIdx, startCol, maxIdx) {
+        let paren = 0;
+        let angle = 0;
+        let seenParen = false;
 
-    static #isControlFlow(name) {
-        const keywords = new Set([
-            'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 
-            'continue', 'return', 'throw', 'try', 'catch', 'finally', 'new',
-            'delete', 'typeof', 'instanceof', 'void', 'in', 'of', 'default',
-            'class', 'function', 'import', 'export', 'const', 'let', 'var',
-            'static', 'async', 'await', 'yield', 'get', 'set', 'constructor',
-            'this', 'super', 'true', 'false', 'null', 'undefined'
-        ]);
-        return keywords.has(name);
-    }
+        for (let i = startIdx; i <= maxIdx && i < lines.length; i++) {
+            const text = lines[i].clean;
+            const from = i === startIdx ? startCol : 0;
+            for (let j = from; j < text.length; j++) {
+                const ch = text[j];
 
-    static #breakdownCode(code) {
-        const lines = code.split('\n');
-        this.#parsedTree.raw.totalLines = lines.length;
-        this.#parsedTree.raw.totalChars = code.length;
-        
-        this.#collectComments(lines);
-        
-        const tokens = this.#tokenize(lines);
-        
-        let i = 0;
-        while (i < tokens.length) {
-            const t = tokens[i];
-            const c = t.trimmed;
-            
-            if (!c) { i++; continue; }
-            
-            // Import
-            if (c.startsWith('import ')) {
-                const imp = this.#parseImport(c);
-                if (imp) {
-                    imp.lineStart = t.lineNum;
-                    imp.lineEnd = t.lineNum;
-                    imp.charCount = this.#calcCharCount(t.lineNum, t.lineNum);
-                    this.#parsedTree.imports.push(imp);
+                if (!seenParen) {
+                    if (ch === '<') { angle++; continue; }
+                    if (ch === '>' && angle > 0 && text[j - 1] !== '=') { angle--; continue; }
                 }
-                i++;
-                continue;
-            }
-            
-            // Standalone export
-            if ((c.startsWith('export {') || c.startsWith('export default') || 
-                 c.startsWith('export type') || c.startsWith('export interface') ||
-                 (c.startsWith('export ') && !c.includes('class') && !c.includes('function'))) &&
-                !c.startsWith('export class') && !c.startsWith('export function')) {
-                this.#parsedTree.exports.push({
-                    statement: t.original.trim(),
-                    line: t.lineNum,
-                    type: c.includes('default') ? 'default' : 'named',
-                    charCount: this.#calcCharCount(t.lineNum, t.lineNum)
-                });
-                i++;
-                continue;
-            }
-            
-            // Class
-            if (c.startsWith('class ') || c.startsWith('export class ')) {
-                const classData = this.#parseClass(tokens, i);
-                if (classData) {
-                    if (this.#parsedTree.jsdoc.length > 0) {
-                        const lastDoc = this.#parsedTree.jsdoc[this.#parsedTree.jsdoc.length - 1];
-                        if (lastDoc.lineEnd === t.lineNum - 1 || lastDoc.lineEnd === t.lineNum) {
-                            classData.jsdoc = lastDoc;
-                        }
-                    }
-                    classData.charCount = this.#calcCharCount(classData.lineStart, classData.lineEnd);
-                    this.#parsedTree.classes.push(classData);
-                    i = classData.bodyEnd;
-                    continue;
-                }
-                i++;
-                continue;
-            }
-            
-            // Function
-            if (c.startsWith('function ') || c.startsWith('async function ') ||
-                c.startsWith('export function ') || c.startsWith('export async function ')) {
-                const funcData = this.#parseFunction(tokens, i);
-                if (funcData) {
-                    if (this.#parsedTree.jsdoc.length > 0) {
-                        const lastDoc = this.#parsedTree.jsdoc[this.#parsedTree.jsdoc.length - 1];
-                        if (lastDoc.lineEnd === t.lineNum - 1 || lastDoc.lineEnd === t.lineNum) {
-                            funcData.jsdoc = lastDoc;
-                        }
-                    }
-                    funcData.charCount = this.#calcCharCount(funcData.lineStart, funcData.lineEnd);
-                    this.#parsedTree.functions.push(funcData);
-                    i = funcData.blockEnd;
-                    continue;
-                }
-                i++;
-                continue;
-            }
-            
-            // Variable
-            if ((c.startsWith('const ') || c.startsWith('let ') || c.startsWith('var ')) &&
-                c.includes('=') && !c.includes('=>') && !c.includes('function(') && 
-                !c.includes('function ') && !c.includes('class ')) {
-                this.#parsedTree.variables.push({
-                    declaration: t.original.trim(),
-                    line: t.lineNum,
-                    kind: c.startsWith('const') ? 'const' : c.startsWith('let') ? 'let' : 'var',
-                    charCount: this.#calcCharCount(t.lineNum, t.lineNum)
-                });
-            }
-            
-            i++;
-        }
-    }
 
-    static #collectComments(lines) {
-        let inBlock = false;
-        let blockStart = 0;
-        let blockLines = [];
-        
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const trimmed = line.trim();
-            const lineNum = i + 1;
-            
-            if (inBlock) {
-                blockLines.push(line);
-                if (trimmed.includes('*/')) {
-                    inBlock = false;
-                    const content = blockLines.join('\n');
-                    const isJSDoc = content.trim().startsWith('/**');
-                    const commentObj = {
-                        type: 'block',
-                        content: content,
-                        lineStart: blockStart,
-                        lineEnd: lineNum,
-                        charCount: this.#calcCharCount(blockStart, lineNum)
-                    };
-                    if (isJSDoc) {
-                        commentObj.parsed = this.#parseJSDoc(content);
-                        this.#parsedTree.jsdoc.push(commentObj);
-                    } else {
-                        this.#parsedTree.comments.push(commentObj);
-                    }
-                    blockLines = [];
+                if (ch === '(' || ch === '[') { paren++; seenParen = true; }
+                else if (ch === ')' || ch === ']') paren--;
+                else if (ch === '{') {
+                    if (angle > 0) { paren++; continue; }
+                    if (paren <= 0) return { idx: i, col: j };
                 }
-                continue;
-            }
-            
-            if (trimmed.startsWith('/*')) {
-                if (trimmed.includes('*/')) {
-                    const isJSDoc = trimmed.startsWith('/**');
-                    const commentObj = {
-                        type: 'block',
-                        content: trimmed,
-                        lineStart: lineNum,
-                        lineEnd: lineNum,
-                        charCount: this.#calcCharCount(lineNum, lineNum)
-                    };
-                    if (isJSDoc) {
-                        commentObj.parsed = this.#parseJSDoc(trimmed);
-                        this.#parsedTree.jsdoc.push(commentObj);
-                    } else {
-                        this.#parsedTree.comments.push(commentObj);
-                    }
-                } else {
-                    inBlock = true;
-                    blockStart = lineNum;
-                    blockLines = [line];
+                else if (ch === '}') {
+                    if (angle > 0) { paren--; continue; }
+                    if (paren <= 0) return null;
                 }
-                continue;
-            }
-            
-            if (trimmed.startsWith('//')) {
-                this.#parsedTree.comments.push({
-                    type: 'line',
-                    content: trimmed,
-                    line: lineNum,
-                    charCount: this.#calcCharCount(lineNum, lineNum)
-                });
+                else if (ch === ';' && paren <= 0) return null;
             }
         }
-    }
-
-    static #parseClass(tokens, startIdx) {
-        const startToken = tokens[startIdx];
-        let clean = startToken.trimmed;
-        if (clean.startsWith('export ')) clean = clean.substring(7).trim();
-        
-        const classMatch = clean.match(/^class\s+(\w+)/);
-        if (!classMatch) return null;
-        
-        const className = classMatch[1];
-        const classData = {
-            name: className,
-            lineStart: startToken.lineNum,
-            extends: null,
-            methods: [],
-            staticMethods: [],
-            getters: [],
-            setters: [],
-            constructor: null,
-            constructorProps: [],
-            properties: [],
-            assignments: [],
-            jsdoc: null,
-            bodyEnd: startIdx
-        };
-        
-        const extMatch = clean.match(/extends\s+(\w+)/);
-        if (extMatch) classData.extends = extMatch[1];
-        
-        let bodyStart = startIdx;
-        for (let i = startIdx; i < tokens.length; i++) {
-            if (tokens[i].clean.includes('{')) {
-                bodyStart = i;
-                break;
-            }
-        }
-        
-        const bodyEnd = this.#findBlockEnd(tokens, bodyStart, tokens.length - 1);
-        classData.lineEnd = tokens[bodyEnd].lineNum;
-        classData.bodyEnd = bodyEnd + 1;
-        
-        this.#parseClassBody(tokens, bodyStart + 1, bodyEnd, classData);
-        
-        return classData;
-    }
-
-    static #parseClassBody(tokens, startIdx, endIdx, classData) {
-        let i = startIdx;
-        let pendingJSDoc = null;
-        
-        while (i < endIdx) {
-            const token = tokens[i];
-            const clean = token.trimmed;
-            
-            if (!clean) { i++; continue; }
-            
-            if (this.#parsedTree.jsdoc.length > 0) {
-                const lastDoc = this.#parsedTree.jsdoc[this.#parsedTree.jsdoc.length - 1];
-                if (lastDoc.lineEnd === token.lineNum - 1 || lastDoc.lineEnd === token.lineNum) {
-                    pendingJSDoc = lastDoc;
-                }
-            }
-            
-            if (clean.startsWith('/**') || clean.startsWith('*') || clean === '*/') {
-                pendingJSDoc = null;
-                i++;
-                continue;
-            }
-            
-            if (clean.startsWith('//') || clean.startsWith('/*')) {
-                i++;
-                continue;
-            }
-            
-            let detected = this.#detectMember(tokens, i, endIdx);
-            
-            if (detected) {
-                if (pendingJSDoc) {
-                    detected.jsdoc = pendingJSDoc;
-                    pendingJSDoc = null;
-                }
-                
-                detected.charCount = this.#calcCharCount(detected.lineStart, detected.lineEnd);
-                
-                switch (detected.type) {
-                    case 'constructor':
-                        classData.constructor = detected;
-                        this.#parseConstructorAssignments(tokens, detected.bodyStart, detected.bodyEnd, classData);
-                        break;
-                    case 'getter':
-                        classData.getters.push(detected);
-                        break;
-                    case 'setter':
-                        classData.setters.push(detected);
-                        break;
-                    case 'static-method':
-                        classData.staticMethods.push(detected);
-                        break;
-                    case 'method':
-                        classData.methods.push(detected);
-                        break;
-                    case 'property':
-                        classData.properties.push(detected);
-                        break;
-                    case 'assignment':
-                        classData.assignments.push(detected);
-                        break;
-                }
-                
-                i = detected.nextIdx;
-                continue;
-            }
-            
-            pendingJSDoc = null;
-            i++;
-        }
-    }
-
-    static #detectMember(tokens, idx, maxIdx) {
-        const token = tokens[idx];
-        const clean = token.trimmed;
-        const lineNum = token.lineNum;
-        
-        if (!clean) return null;
-        
-        // CONSTRUCTOR
-        if (/^constructor\s*\(/.test(clean)) {
-            let bodyStart = idx;
-            if (!clean.includes('{')) {
-                for (let j = idx; j < maxIdx; j++) {
-                    if (tokens[j].clean.includes('{')) { bodyStart = j; break; }
-                }
-            }
-            const bodyEnd = this.#findBlockEnd(tokens, bodyStart, maxIdx);
-            return {
-                name: 'constructor',
-                type: 'constructor',
-                isStatic: false,
-                isAsync: false,
-                lineStart: lineNum,
-                lineEnd: tokens[bodyEnd].lineNum,
-                bodyStart: bodyStart + 1,
-                bodyEnd: bodyEnd,
-                nextIdx: bodyEnd + 1,
-                params: this.#parseParams(clean)
-            };
-        }
-        
-        // STATIC
-        if (/^static\s+/.test(clean)) {
-            const rest = clean.replace(/^static\s+/, '');
-            
-            if (/^get\s+/.test(rest)) {
-                const name = this.#extractName(rest)[1] || 'unknown';
-                return this.#buildMethodResult(tokens, idx, maxIdx, name, 'getter', true, false);
-            }
-            if (/^set\s+/.test(rest)) {
-                const name = this.#extractName(rest)[1] || 'unknown';
-                return this.#buildMethodResult(tokens, idx, maxIdx, name, 'setter', true, false);
-            }
-            if (/^async\s+/.test(rest)) {
-                const name = this.#extractName(rest)[1] || 'unknown';
-                return this.#buildMethodResult(tokens, idx, maxIdx, name, 'static-method', true, true);
-            }
-            if (/^\w+\s*=/.test(rest)) {
-                const name = this.#extractName(rest)[0];
-                if (name && !this.#isControlFlow(name)) {
-                    return this.#buildAssignmentResult(tokens, idx, maxIdx, name, true);
-                }
-            }
-            if (/^\w+\s*\(/.test(rest)) {
-                const name = this.#extractName(rest)[0];
-                if (name && !this.#isControlFlow(name)) {
-                    return this.#buildMethodResult(tokens, idx, maxIdx, name, 'static-method', true, false);
-                }
-            }
-            return null;
-        }
-        
-        // GETTER
-        if (/^get\s+/.test(clean)) {
-            const name = this.#extractName(clean)[1] || 'unknown';
-            return this.#buildMethodResult(tokens, idx, maxIdx, name, 'getter', false, false);
-        }
-        
-        // SETTER
-        if (/^set\s+/.test(clean)) {
-            const name = this.#extractName(clean)[1] || 'unknown';
-            return this.#buildMethodResult(tokens, idx, maxIdx, name, 'setter', false, false);
-        }
-        
-        // ASYNC METHOD
-        if (/^async\s+/.test(clean)) {
-            const rest = clean.replace(/^async\s+/, '');
-            const name = this.#extractName(rest)[0];
-            if (name && !this.#isControlFlow(name)) {
-                return this.#buildMethodResult(tokens, idx, maxIdx, name, 'method', false, true);
-            }
-        }
-        
-        // THIS.X = ...
-        if (/^this\.\w+\s*=/.test(clean)) {
-            const match = clean.match(/^this\.(\w+)\s*=/);
-            if (match) {
-                const name = match[1];
-                if (!this.#isControlFlow(name)) {
-                    const afterEq = clean.substring(clean.indexOf('=') + 1).trim();
-                    if (afterEq.startsWith('async') || afterEq.startsWith('function') || 
-                        afterEq.startsWith('(') || afterEq.includes('=>')) {
-                        return this.#buildMethodResult(tokens, idx, maxIdx, name, 'method', false, 
-                            afterEq.startsWith('async'));
-                    } else {
-                        return this.#buildAssignmentResult(tokens, idx, maxIdx, name, false);
-                    }
-                }
-            }
-        }
-        
-        // REGULAR METHOD
-        const nameMatch = clean.match(/^(\w+)\s*[=(]/);
-        if (nameMatch) {
-            const name = nameMatch[1];
-            if (!this.#isControlFlow(name)) {
-                if (clean.includes('(') && (clean.includes('{') || clean.includes('=>'))) {
-                    return this.#buildMethodResult(tokens, idx, maxIdx, name, 'method', false, false);
-                }
-                if (clean.includes('=')) {
-                    return this.#buildAssignmentResult(tokens, idx, maxIdx, name, false);
-                }
-            }
-        }
-        
         return null;
     }
 
-    static #buildMethodResult(tokens, idx, maxIdx, name, type, isStatic, isAsync) {
-        const lineNum = tokens[idx].lineNum;
-        let bodyStart = idx;
-        
-        if (!tokens[idx].trimmed.includes('{')) {
-            for (let j = idx; j < maxIdx; j++) {
-                if (tokens[j].clean.includes('{')) {
-                    bodyStart = j;
-                    break;
-                }
-            }
-        }
-        
-        let bodyEnd = idx;
-        if (tokens[bodyStart].clean.includes('{')) {
-            bodyEnd = this.#findBlockEnd(tokens, bodyStart, maxIdx);
-        } else {
-            bodyEnd = idx;
-            for (let j = idx; j < maxIdx; j++) {
-                if (tokens[j].trimmed.endsWith(';') || tokens[j].trimmed.endsWith('}')) {
-                    bodyEnd = j;
-                    break;
-                }
-            }
-        }
-        
-        // Validate bodyEnd is within range
-        bodyEnd = Math.min(bodyEnd, maxIdx);
-        
-        return {
-            name,
-            type,
-            isStatic,
-            isAsync,
-            lineStart: lineNum,
-            lineEnd: tokens[bodyEnd].lineNum,
-            nextIdx: bodyEnd + 1,
-            params: this.#parseParams(tokens[idx].trimmed)
-        };
-    }
-
-    static #buildAssignmentResult(tokens, idx, maxIdx, name, isStatic) {
-        const lineNum = tokens[idx].lineNum;
-        let endIdx = idx;
-        
-        if (!tokens[idx].trimmed.endsWith(';') && !tokens[idx].trimmed.endsWith('}')) {
-            for (let j = idx; j < maxIdx; j++) {
-                const t = tokens[j].trimmed;
-                if (t.endsWith(';') || t.endsWith('}') || t.endsWith(')') || t.endsWith(']')) {
-                    endIdx = j;
-                    break;
-                }
-                if (j > idx && tokens[j].trimmed && !tokens[j-1].trimmed.endsWith(',')) {
-                    endIdx = j - 1;
-                    break;
-                }
-            }
-        }
-        
-        // Validate endIdx is within range
-        endIdx = Math.min(endIdx, maxIdx);
-        
-        return {
-            name,
-            type: 'assignment',
-            isStatic,
-            isAsync: false,
-            lineStart: lineNum,
-            lineEnd: tokens[endIdx].lineNum,
-            nextIdx: endIdx + 1,
-            params: []
-        };
-    }
-
-    static #parseConstructorAssignments(tokens, bodyStart, bodyEnd, classData) {
-        for (let i = bodyStart; i < bodyEnd; i++) {
-            const clean = tokens[i].trimmed;
-            if (!clean) continue;
-            
-            const firstWord = clean.split(/\s+/)[0];
-            if (this.#isControlFlow(firstWord)) continue;
-            
-            const match = clean.match(/^this\.(\w+)\s*=/);
-            if (match) {
-                const name = match[1];
-                if (!this.#isControlFlow(name)) {
-                    let end = i;
-                    if (!clean.endsWith(';') && !clean.endsWith('}') && !clean.endsWith(')') && !clean.endsWith(']')) {
-                        let depth = 0;
-                        for (let j = i; j < bodyEnd; j++) {
-                            const l = tokens[j].clean;
-                            for (const ch of l) {
-                                if (ch === '{' || ch === '(' || ch === '[') depth++;
-                                else if (ch === '}' || ch === ')' || ch === ']') depth--;
-                            }
-                            if (depth <= 0 && (l.endsWith(';') || l.endsWith('}') || l.endsWith(')') || l.endsWith(']') || l.endsWith(','))) {
-                                end = j;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    // Validate end is within range
-                    end = Math.min(end, bodyEnd - 1);
-                    
-                    const propData = {
-                        name,
-                        type: 'constructor-prop',
-                        isStatic: false,
-                        isAsync: false,
-                        lineStart: tokens[i].lineNum,
-                        lineEnd: tokens[end].lineNum,
-                        params: []
-                    };
-                    propData.charCount = this.#calcCharCount(propData.lineStart, propData.lineEnd);
-                    
-                    classData.constructorProps.push(propData);
-                    
-                    i = end;
-                }
-            }
-        }
-    }
-
-    static #parseParams(clean) {
-        const start = clean.indexOf('(');
-        if (start === -1) return [];
-        
+    static findStatementEnd(lines, startIdx, startCol, maxIdx, opts = {}) {
+        const commaEnds = opts.commaEnds === true;
         let depth = 0;
-        for (let i = start; i < clean.length; i++) {
-            if (clean[i] === '(') depth++;
-            else if (clean[i] === ')') {
+
+        for (let i = startIdx; i <= maxIdx && i < lines.length; i++) {
+            const text = lines[i].clean;
+            const from = i === startIdx ? startCol : 0;
+
+            for (let j = from; j < text.length; j++) {
+                const ch = text[j];
+                if (OPENERS.includes(ch)) depth++;
+                else if (CLOSERS.includes(ch)) {
+                    if (depth === 0) return Math.max(startIdx, i - 1);
+                    depth--;
+                    if (depth === 0 && ch === '}' && text.slice(j + 1).trim() === '') return i;
+                }
+                else if (ch === ';' && depth === 0) return i;
+                else if (ch === ',' && depth === 0 && commaEnds) return i;
+            }
+
+            if (depth !== 0) continue;
+
+            const trimmed = text.trimEnd();
+            if (!trimmed) continue;
+            if (RE_CONTINUES.test(trimmed)) continue;
+
+            const nextCode = Scanner.nextCodeLine(lines, i + 1, maxIdx);
+            if (nextCode && RE_CONTINUATION_START.test(nextCode.clean.trim())) continue;
+
+            return i;
+        }
+        return Math.min(maxIdx, lines.length - 1);
+    }
+
+    static nextCodeLine(lines, from, maxIdx) {
+        for (let i = from; i <= maxIdx && i < lines.length; i++) {
+            if (lines[i].hasCode) return lines[i];
+        }
+        return null;
+    }
+
+    static docRangeAbove(lines, idx) {
+        let k = idx - 1;
+        let end = null;
+        while (k >= 0 && lines[k].commentOnly) { end = end ?? k; k--; }
+        if (end === null) return null;
+        return { startIdx: k + 1, endIdx: end };
+    }
+
+    static firstCodeCol(rec) {
+        const idx = rec.clean.search(/\S/);
+        return idx === -1 ? 0 : idx;
+    }
+
+    static indentOf(text) {
+        const m = text.match(/^[ \t]*/);
+        return m ? m[0] : '';
+    }
+}
+
+/* ============================================================================
+ * 3. STRUCTURE PARSER
+ * ========================================================================== */
+
+const RE_CONTAINER = /^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:const\s+)?(class|interface|enum)\s+([#\w$]+)/;
+const RE_FUNCTION = /^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:async\s+)?function\s*\*?\s*([\w$]+)/;
+const RE_VARIABLE = /^(?:export\s+)?(?:declare\s+)?(const|let|var)\s+/;
+const RE_TYPEALIAS = /^(?:export\s+)?(?:declare\s+)?type\s+([\w$]+)/;
+const RE_MEMBER_MODIFIER = /^(public|private|protected|readonly|static|async|abstract|override|declare|accessor)\s+/;
+const RE_FN_INIT = /=\s*(?:async\s+)?(?:function\b|\(|<|[\w$]+\s*=>)/;
+
+class StructureParser {
+    static parse(code, filePath) {
+        const lines = Tokenizer.tokenize(code);
+        const blocks = Tokenizer.collectBlocks(lines);
+
+        const tree = {
+            filePath,
+            code,
+            lines,
+            imports: [],
+            exports: [],
+            containers: [],
+            functions: [],
+            variables: [],
+            comments: blocks.filter(b => !b.isDoc),
+            jsdoc: blocks.filter(b => b.isDoc),
+            raw: {
+                lines: code.split('\n'),
+                totalLines: lines.length,
+                totalChars: code.length
+            }
+        };
+
+        for (const block of [...tree.comments, ...tree.jsdoc]) {
+            block.charCount = this.#charCount(lines, block.lineStart, block.lineEnd);
+        }
+
+        this.#parseTopLevel(tree);
+        return tree;
+    }
+
+    static #parseTopLevel(tree) {
+        const lines = tree.lines;
+        const max = lines.length - 1;
+        let i = 0;
+
+        while (i <= max) {
+            const rec = lines[i];
+
+            if (!rec.hasCode || rec.depthStart > 0) { i++; continue; }
+
+            const col = Scanner.firstCodeCol(rec);
+            const clean = rec.clean.trim();
+            const doc = Scanner.docRangeAbove(lines, i);
+
+            if (/^import\b/.test(clean) && !/^import\s*\(/.test(clean)) {
+                const endIdx = Scanner.findStatementEnd(lines, i, col, max);
+                tree.imports.push(this.#buildStatement(tree, 'import', i, endIdx, doc, {
+                    ...this.#parseImportMeta(this.#joinClean(lines, i, endIdx))
+                }));
+                i = endIdx + 1;
+                continue;
+            }
+
+            const cm = clean.match(RE_CONTAINER);
+            if (cm) {
+                const container = this.#parseContainer(tree, i, max, cm[1], cm[2], doc);
+                if (container) {
+                    tree.containers.push(container);
+                    i = container.endIdx + 1;
+                    continue;
+                }
+            }
+
+            const fm = clean.match(RE_FUNCTION);
+            if (fm) {
+                const body = Scanner.findBodyStart(lines, i, col, max);
+                const endIdx = body
+                    ? Scanner.findBlockEnd(lines, body.idx, body.col, max).idx
+                    : Scanner.findStatementEnd(lines, i, col, max);
+                tree.functions.push(this.#buildStatement(tree, 'function', i, endIdx, doc, {
+                    name: fm[1],
+                    isAsync: /\basync\b/.test(clean),
+                    isExported: /^export\b/.test(clean),
+                    form: 'declaration',
+                    params: this.#parseParams(this.#joinClean(lines, i, body ? body.idx : endIdx))
+                }));
+                i = endIdx + 1;
+                continue;
+            }
+
+            const vm = clean.match(RE_VARIABLE);
+            if (vm) {
+                const endIdx = Scanner.findStatementEnd(lines, i, col, max);
+                const full = this.#joinClean(lines, i, endIdx);
+                const nameMatch = clean.match(/^(?:export\s+)?(?:declare\s+)?(?:const|let|var)\s+([\w$]+)/);
+                const name = nameMatch ? nameMatch[1] : clean.slice(0, 40).trim();
+                const isFn = RE_FN_INIT.test(full) && (/=>/.test(full) || /\bfunction\b/.test(full));
+
+                if (isFn) {
+                    tree.functions.push(this.#buildStatement(tree, 'function', i, endIdx, doc, {
+                        name,
+                        isAsync: /=\s*async\b/.test(full),
+                        isExported: /^export\b/.test(clean),
+                        form: /\bfunction\b/.test(full) ? 'expression' : 'arrow',
+                        params: this.#parseParams(full.slice(full.indexOf('=') + 1))
+                    }));
+                } else {
+                    tree.variables.push(this.#buildStatement(tree, 'variable', i, endIdx, doc, {
+                        name,
+                        kind: vm[1],
+                        isExported: /^export\b/.test(clean),
+                        declaration: rec.original.trim()
+                    }));
+                }
+                i = endIdx + 1;
+                continue;
+            }
+
+            const tm = clean.match(RE_TYPEALIAS);
+            if (tm) {
+                const endIdx = Scanner.findStatementEnd(lines, i, col, max);
+                tree.variables.push(this.#buildStatement(tree, 'variable', i, endIdx, doc, {
+                    name: tm[1],
+                    kind: 'type',
+                    isExported: /^export\b/.test(clean),
+                    declaration: rec.original.trim()
+                }));
+                i = endIdx + 1;
+                continue;
+            }
+
+            if (/^export\b/.test(clean)) {
+                const endIdx = Scanner.findStatementEnd(lines, i, col, max);
+                tree.exports.push(this.#buildStatement(tree, 'export', i, endIdx, doc, {
+                    statement: rec.original.trim(),
+                    name: rec.original.trim().slice(0, 60),
+                    kind: /\bdefault\b/.test(clean) ? 'default' : 'named'
+                }));
+                i = endIdx + 1;
+                continue;
+            }
+
+            i++;
+        }
+    }
+
+    static #parseContainer(tree, idx, max, kind, name, doc) {
+        const lines = tree.lines;
+        const col = Scanner.firstCodeCol(lines[idx]);
+        const open = Scanner.findBodyStart(lines, idx, col, max);
+        if (!open) return null;
+
+        const close = Scanner.findBlockEnd(lines, open.idx, open.col, max);
+
+        const container = {
+            type: 'container',
+            kind,
+            name,
+            isExported: /^export\b/.test(lines[idx].clean.trim()),
+            isAbstract: /\babstract\b/.test(lines[idx].clean),
+            extends: null,
+            implements: [],
+            lineStart: lines[idx].num,
+            lineEnd: lines[close.idx].num,
+            startIdx: idx,
+            endIdx: close.idx,
+            headerIdx: open.idx,
+            headerCol: open.col,
+            footerIdx: close.idx,
+            footerCol: close.col,
+            singleLine: open.idx === close.idx,
+            indent: Scanner.indentOf(lines[idx].original),
+            doc: this.#docInfo(lines, doc),
+            members: []
+        };
+
+        const header = this.#joinClean(lines, idx, open.idx);
+        const ext = header.match(/\bextends\s+([\w$.]+)/);
+        if (ext) container.extends = ext[1];
+        const impl = header.match(/\bimplements\s+([^{]+)/);
+        if (impl) container.implements = impl[1].split(',').map(s => s.trim()).filter(Boolean);
+
+        if (!container.singleLine) {
+            const bodyDepth = lines[idx].depthStart + 1;
+            if (kind === 'class') this.#parseClassBody(tree, container, open.idx + 1, close.idx - 1, bodyDepth);
+            else this.#parseSignatureBody(tree, container, open.idx + 1, close.idx - 1, bodyDepth);
+        }
+
+        container.charCount = this.#charCount(lines, container.lineStart, container.lineEnd);
+        this.#assignIds(container);
+        return container;
+    }
+
+    static #parseClassBody(tree, container, from, to, bodyDepth) {
+        const lines = tree.lines;
+        let i = from;
+
+        while (i <= to) {
+            const rec = lines[i];
+            if (!rec.hasCode || rec.depthStart !== bodyDepth) { i++; continue; }
+
+            const member = this.#parseClassMember(tree, container, i, to, bodyDepth);
+            if (!member) { i++; continue; }
+
+            container.members.push(member);
+            i = Math.max(member.endIdx + 1, i + 1);
+        }
+    }
+
+    static #parseClassMember(tree, container, idx, to, bodyDepth) {
+        const lines = tree.lines;
+        const rec = lines[idx];
+        const col = Scanner.firstCodeCol(rec);
+        let rest = rec.clean.trim();
+
+        const mods = {
+            isStatic: false, isAsync: false, isAbstract: false,
+            isReadonly: false, isGenerator: false, accessibility: null
+        };
+
+        let guard = 0;
+        let m;
+        while ((m = rest.match(RE_MEMBER_MODIFIER)) && guard++ < 8) {
+            const rem = rest.slice(m[0].length);
+            if (!rem) break;
+            switch (m[1]) {
+                case 'static': mods.isStatic = true; break;
+                case 'async': mods.isAsync = true; break;
+                case 'abstract': mods.isAbstract = true; break;
+                case 'readonly': mods.isReadonly = true; break;
+                case 'public': case 'private': case 'protected': mods.accessibility = m[1]; break;
+                default: break;
+            }
+            rest = rem;
+        }
+
+        if (/^\*/.test(rest)) { mods.isGenerator = true; rest = rest.replace(/^\*\s*/, ''); }
+
+        let kind = null;
+        let name = null;
+        let hit;
+
+        if (mods.isStatic && /^\{/.test(rest)) {
+            const open = rec.clean.indexOf('{', col);
+            const close = Scanner.findBlockEnd(lines, idx, open, to);
+            const doc = Scanner.docRangeAbove(lines, idx);
+            const block = {
+                type: 'member', kind: 'static-block', name: 'static{}', container: container.name,
+                ...mods, lineStart: rec.num, lineEnd: lines[close.idx].num,
+                startIdx: idx, endIdx: Math.min(close.idx, to),
+                doc: this.#docInfo(lines, doc), params: [], children: []
+            };
+            block.charCount = this.#charCount(lines, block.lineStart, block.lineEnd);
+            return block;
+        }
+
+        if (/^constructor\s*\(/.test(rest)) {
+            kind = 'constructor';
+            name = 'constructor';
+        } else if ((hit = rest.match(/^(get|set)\s+(#?[\w$]+|\[[^\]]*\])\s*\(/))) {
+            kind = hit[1] === 'get' ? 'getter' : 'setter';
+            name = hit[2];
+        } else if ((hit = rest.match(/^(#?[\w$]+|\[[^\]]*\])\s*\??\s*\(/))) {
+            kind = 'method';
+            name = hit[1];
+        } else if ((hit = rest.match(/^(#?[\w$]+|\[[^\]]*\])\s*\??\s*[:=][^=]/))) {
+            kind = 'field';
+            name = hit[1];
+        } else if ((hit = rest.match(/^(#?[\w$]+)\s*\??\s*;\s*$/))) {
+            kind = 'property';
+            name = hit[1];
+        } else {
+            return null;
+        }
+
+        if (name.startsWith('[')) {
+            const open = rec.clean.indexOf('[', col);
+            const close = rec.clean.indexOf(']', open);
+            if (open !== -1 && close !== -1) name = rec.original.slice(open, close + 1);
+        }
+
+        let endIdx;
+        let bodyStart = null;
+
+        if (kind === 'field' || kind === 'property') {
+            endIdx = Scanner.findStatementEnd(lines, idx, col, to);
+        } else {
+            bodyStart = Scanner.findBodyStart(lines, idx, col, to);
+            endIdx = bodyStart
+                ? Scanner.findBlockEnd(lines, bodyStart.idx, bodyStart.col, to).idx
+                : Scanner.findStatementEnd(lines, idx, col, to);
+        }
+        endIdx = Math.max(idx, Math.min(endIdx, to));
+
+        const doc = Scanner.docRangeAbove(lines, idx);
+        const member = {
+            type: 'member',
+            kind,
+            name,
+            container: container.name,
+            ...mods,
+            lineStart: rec.num,
+            lineEnd: lines[endIdx].num,
+            startIdx: idx,
+            endIdx,
+            doc: this.#docInfo(lines, doc),
+            params: this.#parseParams(this.#joinClean(lines, idx, bodyStart ? bodyStart.idx : endIdx)),
+            children: []
+        };
+        member.charCount = this.#charCount(lines, member.lineStart, member.lineEnd);
+
+        if (kind === 'constructor' && bodyStart) {
+            this.#parseConstructorProps(tree, member, bodyStart.idx + 1, endIdx - 1, bodyDepth + 1);
+        }
+
+        return member;
+    }
+
+    static #parseConstructorProps(tree, ctor, from, to, propDepth) {
+        const lines = tree.lines;
+        let i = from;
+
+        while (i <= to) {
+            const rec = lines[i];
+            if (!rec.hasCode || rec.depthStart !== propDepth) { i++; continue; }
+
+            const hit = rec.clean.trim().match(/^this\.(#?[\w$]+)\s*=[^=]/);
+            if (!hit) { i++; continue; }
+
+            const col = Scanner.firstCodeCol(rec);
+            const endIdx = Math.min(Scanner.findStatementEnd(lines, i, col, to), to);
+            const doc = Scanner.docRangeAbove(lines, i);
+
+            const child = {
+                type: 'member',
+                kind: 'constructor-prop',
+                name: hit[1],
+                container: ctor.container,
+                isStatic: false, isAsync: false, isGenerator: false,
+                isAbstract: false, isReadonly: false, accessibility: null,
+                lineStart: rec.num,
+                lineEnd: lines[endIdx].num,
+                startIdx: i,
+                endIdx,
+                doc: this.#docInfo(lines, doc),
+                params: [],
+                children: []
+            };
+            child.charCount = this.#charCount(lines, child.lineStart, child.lineEnd);
+            ctor.children.push(child);
+
+            i = Math.max(endIdx + 1, i + 1);
+        }
+    }
+
+    static #parseSignatureBody(tree, container, from, to, bodyDepth) {
+        const lines = tree.lines;
+        let i = from;
+
+        while (i <= to) {
+            const rec = lines[i];
+            if (!rec.hasCode || rec.depthStart !== bodyDepth) { i++; continue; }
+
+            const col = Scanner.firstCodeCol(rec);
+            let rest = rec.clean.trim();
+            const isReadonly = /^readonly\s+/.test(rest);
+            if (isReadonly) rest = rest.replace(/^readonly\s+/, '');
+
+            let name = null;
+            let kind = container.kind === 'enum' ? 'enum-member' : 'property';
+            let hit;
+
+            if ((hit = rest.match(/^(new\s+)?\(/))) {
+                name = hit[1] ? 'new()' : '()';
+                kind = 'signature';
+            } else if ((hit = rest.match(/^(\[[^\]]*\]|#?[\w$]+)\s*\??\s*(\(|<)/))) {
+                name = hit[1];
+                kind = 'signature';
+            } else if ((hit = rest.match(/^(\[[^\]]*\]|#?[\w$]+)\s*(\?)?\s*[:=,;]?/)) && hit[1]) {
+                name = hit[1];
+            } else {
+                i++;
+                continue;
+            }
+
+            const endIdx = Math.min(Scanner.findStatementEnd(lines, i, col, to, { commaEnds: true }), to);
+            const doc = Scanner.docRangeAbove(lines, i);
+
+            const member = {
+                type: 'member',
+                kind,
+                name,
+                container: container.name,
+                isStatic: false, isAsync: false, isGenerator: false,
+                isAbstract: false, isReadonly, accessibility: null,
+                isOptional: /\?\s*[:(]?/.test(rest.slice(name.length, name.length + 3)),
+                lineStart: rec.num,
+                lineEnd: lines[endIdx].num,
+                startIdx: i,
+                endIdx,
+                doc: this.#docInfo(lines, doc),
+                params: kind === 'signature' ? this.#parseParams(this.#joinClean(lines, i, endIdx)) : [],
+                children: []
+            };
+            member.charCount = this.#charCount(lines, member.lineStart, member.lineEnd);
+            container.members.push(member);
+
+            i = Math.max(endIdx + 1, i + 1);
+        }
+    }
+
+    static #assignIds(container) {
+        const used = new Set();
+        const make = (member) => {
+            let base = `${container.name}.${member.kind}:${member.name}`;
+            let id = base;
+            let n = 2;
+            while (used.has(id)) id = `${base}#${n++}`;
+            used.add(id);
+            member.id = id;
+            for (const child of member.children) {
+                let cbase = `${id}>${child.name}`;
+                let cid = cbase;
+                let k = 2;
+                while (used.has(cid)) cid = `${cbase}#${k++}`;
+                used.add(cid);
+                child.id = cid;
+            }
+        };
+        container.members.forEach(make);
+    }
+
+    static #buildStatement(tree, type, startIdx, endIdx, doc, extra) {
+        const lines = tree.lines;
+        const safeEnd = Math.max(startIdx, Math.min(endIdx, lines.length - 1));
+        const node = {
+            type,
+            startIdx,
+            endIdx: safeEnd,
+            lineStart: lines[startIdx].num,
+            lineEnd: lines[safeEnd].num,
+            doc: this.#docInfo(lines, doc),
+            ...extra
+        };
+        node.charCount = this.#charCount(lines, node.lineStart, node.lineEnd);
+        return node;
+    }
+
+    static #docInfo(lines, doc) {
+        if (!doc) return null;
+        return {
+            startIdx: doc.startIdx,
+            endIdx: doc.endIdx,
+            lineStart: lines[doc.startIdx].num,
+            lineEnd: lines[doc.endIdx].num
+        };
+    }
+
+    static #joinClean(lines, from, to) {
+        const parts = [];
+        for (let i = from; i <= to && i < lines.length; i++) parts.push(lines[i].clean.trim());
+        return parts.join(' ');
+    }
+
+    static #charCount(lines, lineStart, lineEnd) {
+        let total = 0;
+        const s = Math.max(0, lineStart - 1);
+        const e = Math.min(lines.length - 1, lineEnd - 1);
+        for (let i = s; i <= e; i++) {
+            total += lines[i].original.length;
+            if (i < e) total += 1;
+        }
+        return total;
+    }
+
+    static #parseParams(text) {
+        const start = text.indexOf('(');
+        if (start === -1) return [];
+
+        let depth = 0;
+        for (let i = start; i < text.length; i++) {
+            const ch = text[i];
+            if (OPENERS.includes(ch)) depth++;
+            else if (CLOSERS.includes(ch)) {
                 depth--;
                 if (depth === 0) {
-                    const params = clean.substring(start + 1, i);
-                    if (!params.trim()) return [];
-                    return params.split(',').map(p => {
-                        const parts = p.trim().split('=');
-                        const name = parts[0].trim().split(/\s+/).pop() || parts[0].trim();
-                        return { name, defaultValue: parts[1]?.trim() || null };
+                    const inner = text.slice(start + 1, i);
+                    if (!inner.trim()) return [];
+                    return this.#splitTopLevel(inner).map(p => {
+                        const eq = p.indexOf('=');
+                        const head = (eq === -1 ? p : p.slice(0, eq)).trim();
+                        const nameOnly = head.split(':')[0].trim().split(/\s+/).pop() || head;
+                        return { name: nameOnly, defaultValue: eq === -1 ? null : p.slice(eq + 1).trim() || null };
                     }).filter(p => p.name);
                 }
             }
@@ -869,146 +841,633 @@ class CodeParser {
         return [];
     }
 
-    static #parseFunction(tokens, startIdx) {
-        const token = tokens[startIdx];
-        let clean = token.trimmed;
-        if (clean.startsWith('export ')) clean = clean.substring(7).trim();
-        
-        const match = clean.match(/(?:async\s+)?function\s+(\w+)\s*\(/);
-        if (!match) return null;
-        
-        const funcData = {
-            name: match[1],
-            isAsync: clean.includes('async'),
-            lineStart: token.lineNum,
-            params: this.#parseParams(clean),
-            jsdoc: null,
-            blockEnd: startIdx
+    static #splitTopLevel(text) {
+        const out = [];
+        let depth = 0;
+        let buf = '';
+        for (const ch of text) {
+            if (OPENERS.includes(ch)) depth++;
+            else if (CLOSERS.includes(ch)) depth--;
+            if (ch === ',' && depth === 0) { out.push(buf); buf = ''; continue; }
+            buf += ch;
+        }
+        if (buf.trim()) out.push(buf);
+        return out;
+    }
+
+    static #parseImportMeta(statement) {
+        const m1 = statement.match(/import\s+([\w$]+)\s*,\s*\{\s*([^}]*)\s*\}\s*from\s+/);
+        if (m1) return { name: m1[1], names: m1[2].split(',').map(s => s.trim()).filter(Boolean), kind: 'mixed', source: this.#importSource(statement) };
+
+        const m2 = statement.match(/import\s*\{\s*([^}]*)\s*\}\s*from\s+/);
+        if (m2) return { names: m2[1].split(',').map(s => s.trim()).filter(Boolean), kind: 'named', source: this.#importSource(statement) };
+
+        const m3 = statement.match(/import\s+\*\s+as\s+([\w$]+)\s+from\s+/);
+        if (m3) return { name: m3[1], kind: 'namespace', source: this.#importSource(statement) };
+
+        const m4 = statement.match(/import\s+([\w$]+)\s+from\s+/);
+        if (m4) return { name: m4[1], kind: 'default', source: this.#importSource(statement) };
+
+        return { kind: 'side-effect', name: '(side-effect)', source: this.#importSource(statement) };
+    }
+
+    static #importSource() { return null; }
+}
+
+/* ============================================================================
+ * 4. SELECTION
+ * ========================================================================== */
+
+class Selection {
+    static empty() {
+        return {
+            version: 6,
+            includeImports: false,
+            includeExports: false,
+            includeVariables: false,
+            functions: [],
+            containers: {},
+            commentMode: 'top-level',
+            jsdocMode: 'top-level',
+            autoKeepPrivateRefs: true
         };
-        
-        let blockStart = startIdx;
-        if (!clean.includes('{')) {
-            for (let i = startIdx; i < tokens.length; i++) {
-                if (tokens[i].clean.includes('{')) {
-                    blockStart = i;
-                    break;
+    }
+
+    static normalize(raw, tree) {
+        const sel = this.empty();
+        if (!raw) return sel;
+
+        sel.includeImports = !!(raw.includeImports);
+        sel.includeExports = !!(raw.includeExports);
+        sel.includeVariables = !!(raw.includeVariables);
+
+        if (Array.isArray(raw.functions)) sel.functions = [...raw.functions];
+        else if (Array.isArray(raw.includeFunctions)) sel.functions = [...raw.includeFunctions];
+
+        sel.commentMode = this.#mode(raw.commentMode, raw.includeAllComments);
+        sel.jsdocMode = this.#mode(raw.jsdocMode, raw.includeAllJSDoc);
+        if (typeof raw.autoKeepPrivateRefs === 'boolean') sel.autoKeepPrivateRefs = raw.autoKeepPrivateRefs;
+
+        if (raw.containers && typeof raw.containers === 'object' && !Array.isArray(raw.containers)) {
+            for (const [name, value] of Object.entries(raw.containers)) {
+                sel.containers[name] = {
+                    members: Array.isArray(value?.members) ? [...value.members] : null
+                };
+            }
+            return sel;
+        }
+
+        if (Array.isArray(raw.includeClasses)) {
+            const legacyMethods = Array.isArray(raw.includeMethods) ? raw.includeMethods : null;
+            for (const name of raw.includeClasses) {
+                let members = null;
+                if (legacyMethods && legacyMethods.length && tree) {
+                    const container = tree.containers.find(c => c.name === name);
+                    if (container) {
+                        members = this.allMemberIds(container)
+                            .filter(id => legacyMethods.includes(this.memberById(container, id)?.name));
+                    }
+                }
+                sel.containers[name] = { members };
+            }
+        }
+
+        return sel;
+    }
+
+    static #mode(explicit, legacyBoolean) {
+        if (typeof explicit === 'string' && COMMENT_MODES.includes(explicit)) return explicit;
+        if (typeof legacyBoolean === 'boolean') return legacyBoolean ? 'keep' : 'top-level';
+        return 'top-level';
+    }
+
+    static allMembers(container) {
+        const out = [];
+        for (const member of container.members) {
+            out.push(member);
+            for (const child of member.children) out.push(child);
+        }
+        return out;
+    }
+
+    static allMemberIds(container) {
+        return this.allMembers(container).map(m => m.id);
+    }
+
+    static memberById(container, id) {
+        return this.allMembers(container).find(m => m.id === id) || null;
+    }
+
+    static isContainerSelected(sel, name) {
+        return Object.prototype.hasOwnProperty.call(sel.containers, name);
+    }
+
+    static isMemberSelected(sel, container, id) {
+        const entry = sel.containers[container.name];
+        if (!entry) return false;
+        if (entry.members === null) return true;
+        return entry.members.includes(id);
+    }
+
+    static toggleContainer(sel, container) {
+        if (this.isContainerSelected(sel, container.name)) delete sel.containers[container.name];
+        else sel.containers[container.name] = { members: null };
+    }
+
+    static toggleMember(sel, container, id) {
+        const entry = sel.containers[container.name];
+        if (!entry) return;
+        if (entry.members === null) entry.members = this.allMemberIds(container);
+        entry.members = entry.members.includes(id)
+            ? entry.members.filter(x => x !== id)
+            : [...entry.members, id];
+    }
+}
+
+/* ============================================================================
+ * 5. COMMENT STRIPPER
+ * ========================================================================== */
+
+class CommentStripper {
+    static apply(outLines, lines, { commentMode, jsdocMode }) {
+        if (commentMode === 'keep' && jsdocMode === 'keep') return outLines;
+
+        const result = [];
+        for (const out of outLines) {
+            if (out.num === null) { result.push(out); continue; }
+
+            const rec = lines[out.num - 1];
+            if (!rec || rec.comments.length === 0) { result.push(out); continue; }
+
+            const doomed = rec.comments.filter(span => this.#shouldRemove(span, commentMode, jsdocMode));
+            if (doomed.length === 0) { result.push(out); continue; }
+
+            const text = this.#removeSpans(rec.original, doomed).replace(/\s+$/, '');
+            if (text.trim() === '' && !rec.hasCode) continue;
+            result.push({ num: rec.hasCode ? out.num : null, text });
+        }
+        return result;
+    }
+
+    static #shouldRemove(span, commentMode, jsdocMode) {
+        const mode = span.isDoc ? jsdocMode : commentMode;
+        if (mode === 'keep') return false;
+        if (mode === 'all') return true;
+        return span.depth === 0;
+    }
+
+    static #removeSpans(text, spans) {
+        const ordered = [...spans].sort((a, b) => b.start - a.start);
+        let out = text;
+        for (const span of ordered) out = out.slice(0, span.start) + out.slice(span.end);
+        return out;
+    }
+}
+
+/* ============================================================================
+ * 6. CODE EMITTER
+ * ========================================================================== */
+
+class CodeEmitter {
+    static generate(tree, selection) {
+        const sel = Selection.normalize(selection, tree);
+        const lines = tree.lines;
+        const notes = [];
+        const units = [];
+
+        const push = (sortKey, build) => units.push({ sortKey, build });
+
+        if (sel.includeImports) {
+            for (const node of tree.imports) push(node.startIdx, () => this.#emitNode(lines, node));
+        }
+        if (sel.includeExports) {
+            const names = this.#emittedNames(tree, sel);
+            for (const node of tree.exports) push(node.startIdx, () => this.#emitExport(lines, node, names, notes));
+        }
+        if (sel.includeVariables) {
+            for (const node of tree.variables) push(node.startIdx, () => this.#emitNode(lines, node));
+        }
+        for (const fn of tree.functions) {
+            if (sel.functions.includes(fn.name)) push(fn.startIdx, () => this.#emitNode(lines, fn));
+        }
+        for (const container of tree.containers) {
+            if (!Selection.isContainerSelected(sel, container.name)) continue;
+            push(container.startIdx, () => this.#emitContainer(lines, container, sel, notes));
+        }
+
+        const attached = this.#attachedDocLines(tree);
+        for (const block of tree.comments) {
+            if (sel.commentMode === 'keep' && block.depth === 0 && !attached.has(block.lineStart)) {
+                push(block.lineStart - 1, () => this.#emitRange(lines, block.lineStart - 1, block.lineEnd - 1));
+            }
+        }
+        for (const block of tree.jsdoc) {
+            if (sel.jsdocMode === 'keep' && block.depth === 0 && !attached.has(block.lineStart)) {
+                push(block.lineStart - 1, () => this.#emitRange(lines, block.lineStart - 1, block.lineEnd - 1));
+            }
+        }
+
+        units.sort((a, b) => a.sortKey - b.sortKey);
+
+        let out = [];
+        let previousEnd = null;
+
+        for (const unit of units) {
+            const chunk = unit.build();
+            if (!chunk.length) continue;
+
+            if (previousEnd !== null && chunk[0].num !== null && chunk[0].num > previousEnd + 1) {
+                out.push({ num: null, text: '' });
+            } else if (previousEnd !== null && chunk[0].num === null) {
+                out.push({ num: null, text: '' });
+            }
+
+            out.push(...chunk);
+            const last = chunk[chunk.length - 1];
+            previousEnd = last.num !== null ? last.num : previousEnd;
+        }
+
+        out = CommentStripper.apply(out, lines, sel);
+        const text = this.#render(out);
+        const validation = this.validate(text);
+
+        return { text, notes, validation, selection: sel };
+    }
+
+    static #attachedDocLines(tree) {
+        const set = new Set();
+        const mark = (node) => { if (node?.doc) set.add(node.doc.lineStart); };
+
+        [...tree.imports, ...tree.exports, ...tree.variables, ...tree.functions].forEach(mark);
+        for (const container of tree.containers) {
+            mark(container);
+            for (const member of Selection.allMembers(container)) mark(member);
+        }
+        return set;
+    }
+
+    static #emittedNames(tree, sel) {
+        const names = new Set();
+        for (const c of tree.containers) if (Selection.isContainerSelected(sel, c.name)) names.add(c.name);
+        for (const f of tree.functions) if (sel.functions.includes(f.name)) names.add(f.name);
+        if (sel.includeVariables) for (const v of tree.variables) names.add(v.name);
+        if (sel.includeImports) {
+            for (const imp of tree.imports) {
+                if (imp.name) names.add(imp.name);
+                for (const n of imp.names || []) names.add(n.split(/\s+as\s+/).pop().trim());
+            }
+        }
+        return names;
+    }
+
+    static #emitExport(lines, node, names, notes) {
+        const clean = this.#joinClean(lines, node.startIdx, node.endIdx);
+
+        if (/\bfrom\b/.test(clean) || /^export\s*\*/.test(clean)) return this.#emitNode(lines, node);
+
+        const def = clean.match(/^export\s+default\s+([\w$]+)\s*;?\s*$/);
+        if (def) {
+            const known = names.has(def[1]);
+            const declared = this.#isDeclaredName(lines, def[1]);
+            if (!known && declared) {
+                notes.push(`"export default ${def[1]}" removido: ${def[1]} não está na saída.`);
+                return [];
+            }
+            return this.#emitNode(lines, node);
+        }
+
+        const braces = clean.match(/^export\s*\{([^}]*)\}/);
+        if (!braces) return this.#emitNode(lines, node);
+
+        const specs = braces[1].split(',').map(s => s.trim()).filter(Boolean);
+        const kept = specs.filter(s => {
+            const local = s.split(/\s+as\s+/)[0].trim();
+            return names.has(local) || !this.#isDeclaredName(lines, local);
+        });
+
+        if (kept.length === specs.length) return this.#emitNode(lines, node);
+
+        const dropped = specs.filter(s => !kept.includes(s)).map(s => s.split(/\s+as\s+/)[0].trim());
+        const indent = Scanner.indentOf(lines[node.startIdx].original);
+
+        if (!kept.length) {
+            notes.push(`"export { ${dropped.join(', ')} }" removido: nenhum desses nomes está na saída.`);
+            return [];
+        }
+        notes.push(`"export {...}" reescrito: removido(s) ${dropped.join(', ')} (não estão na saída).`);
+
+        const chunk = [];
+        if (node.doc) chunk.push(...this.#emitRange(lines, node.doc.startIdx, node.doc.endIdx));
+        chunk.push({ num: null, text: `${indent}export { ${kept.join(', ')} };` });
+        return chunk;
+    }
+
+    static #isDeclaredName(lines, name) {
+        const re = new RegExp(`\\b(?:class|interface|enum|function|const|let|var)\\s+${name}\\b`);
+        return lines.some(rec => re.test(rec.clean));
+    }
+
+    static #joinClean(lines, from, to) {
+        const parts = [];
+        for (let i = from; i <= to && i < lines.length; i++) parts.push(lines[i].clean.trim());
+        return parts.join(' ').trim();
+    }
+
+    static #emitNode(lines, node) {
+        const chunk = [];
+        if (node.doc) chunk.push(...this.#emitRange(lines, node.doc.startIdx, node.doc.endIdx));
+        chunk.push(...this.#emitRange(lines, node.startIdx, node.endIdx));
+        return chunk;
+    }
+
+    static #emitRange(lines, fromIdx, toIdx) {
+        const chunk = [];
+        for (let i = Math.max(0, fromIdx); i <= Math.min(toIdx, lines.length - 1); i++) {
+            chunk.push({ num: lines[i].num, text: lines[i].original });
+        }
+        return chunk;
+    }
+
+    static #emitContainer(lines, container, sel, notes) {
+        const entry = sel.containers[container.name];
+        const filtering = entry && entry.members !== null;
+
+        if (container.singleLine) {
+            if (filtering) notes.push(`"${container.name}" está em uma única linha — emitido inteiro, sem filtro de membros.`);
+            return this.#emitNode(lines, container);
+        }
+
+        if (!filtering) return this.#emitNode(lines, container);
+
+        const keep = this.#resolveKeepSet(lines, container, sel, notes);
+
+        const chunk = [];
+        if (container.doc) chunk.push(...this.#emitRange(lines, container.doc.startIdx, container.doc.endIdx));
+
+        chunk.push(...this.#emitRange(lines, container.startIdx, container.headerIdx - 1));
+        chunk.push(this.#slice(lines[container.headerIdx], 0, container.headerCol + 1));
+
+        const members = [...container.members].sort((a, b) => a.startIdx - b.startIdx);
+        let lastEnd = null;
+
+        for (const member of members) {
+            if (!keep.has(member.id)) continue;
+
+            const body = this.#emitMember(lines, container, member, keep);
+            if (!body.length) continue;
+
+            if (lastEnd !== null && body[0].num !== null && body[0].num > lastEnd + 1) {
+                chunk.push({ num: null, text: '' });
+            }
+            chunk.push(...body);
+            const last = body[body.length - 1];
+            lastEnd = last.num !== null ? last.num : lastEnd;
+        }
+
+        chunk.push(this.#closing(lines, container));
+        return chunk;
+    }
+
+    static #resolveKeepSet(lines, container, sel, notes) {
+        const keep = new Set(
+            Selection.allMembers(container)
+                .filter(m => Selection.isMemberSelected(sel, container, m.id))
+                .map(m => m.id)
+        );
+
+        const privates = new Map();
+        for (const member of container.members) {
+            if (typeof member.name === 'string' && member.name.startsWith('#')) privates.set(member.name, member);
+        }
+        if (!privates.size) return keep;
+
+        const restored = new Set();
+        let changed = true;
+
+        while (changed) {
+            changed = false;
+            const used = new Set();
+
+            for (const member of container.members) {
+                if (!keep.has(member.id)) continue;
+                for (let i = member.startIdx; i <= member.endIdx; i++) {
+                    for (const ref of lines[i].original.match(/#[A-Za-z_$][\w$]*/g) || []) used.add(ref);
+                }
+            }
+
+            for (const name of used) {
+                const owner = privates.get(name);
+                if (!owner || keep.has(owner.id)) continue;
+                if (!sel.autoKeepPrivateRefs) {
+                    notes.push(`"${container.name}": ${name} foi removido mas ainda é referenciado — isso é erro de sintaxe em JS.`);
+                    continue;
+                }
+                keep.add(owner.id);
+                owner.children.forEach(c => keep.add(c.id));
+                restored.add(name);
+                changed = true;
+            }
+        }
+
+        if (restored.size) {
+            notes.push(`"${container.name}": mantidos automaticamente ${[...restored].join(', ')} — são #privados ainda referenciados pelos membros selecionados.`);
+        }
+        return keep;
+    }
+
+    static #emitMember(lines, container, member, keep) {
+        const chunk = [];
+        if (member.doc) chunk.push(...this.#emitRange(lines, member.doc.startIdx, member.doc.endIdx));
+
+        if (member.kind === 'constructor' && member.children.length) {
+            const dropped = member.children.filter(c => !keep.has(c.id));
+            if (dropped.length) {
+                const skip = new Set();
+                for (const child of dropped) {
+                    for (let i = child.startIdx; i <= child.endIdx; i++) skip.add(i);
+                    if (child.doc) for (let i = child.doc.startIdx; i <= child.doc.endIdx; i++) skip.add(i);
+                }
+                for (let i = member.startIdx; i <= member.endIdx; i++) {
+                    if (skip.has(i)) continue;
+                    chunk.push({ num: lines[i].num, text: lines[i].original });
+                }
+                return chunk;
+            }
+        }
+
+        chunk.push(...this.#emitRange(lines, member.startIdx, member.endIdx));
+        return chunk;
+    }
+
+    static #closing(lines, container) {
+        const rec = lines[container.footerIdx];
+        if (container.footerCol < 0) return { num: null, text: `${container.indent}}` };
+
+        const tail = rec.original.slice(container.footerCol).trimEnd();
+        const text = container.indent + (tail.startsWith('}') ? tail : '}');
+        return { num: text === rec.original.trimEnd() ? rec.num : null, text };
+    }
+
+    static #slice(rec, from, to) {
+        const text = rec.original.slice(from, to).trimEnd();
+        return { num: text === rec.original.trimEnd() ? rec.num : null, text };
+    }
+
+    static #render(outLines) {
+        const texts = outLines.map(l => l.text);
+
+        const cleaned = [];
+        for (const text of texts) {
+            const blank = text.trim() === '';
+            if (blank && (cleaned.length === 0 || cleaned[cleaned.length - 1].trim() === '')) continue;
+            cleaned.push(blank ? '' : text);
+        }
+        while (cleaned.length && cleaned[cleaned.length - 1].trim() === '') cleaned.pop();
+
+        return cleaned.length ? cleaned.join('\n') + '\n' : '';
+    }
+
+    static validate(text) {
+        const issues = [];
+        if (!text.trim()) return { ok: true, issues, balanced: true };
+
+        const lines = Tokenizer.tokenize(text);
+        const stack = [];
+        const pairs = { ')': '(', ']': '[', '}': '{' };
+
+        for (const rec of lines) {
+            for (let j = 0; j < rec.clean.length; j++) {
+                const ch = rec.clean[j];
+                if (OPENERS.includes(ch)) stack.push({ ch, line: rec.num });
+                else if (CLOSERS.includes(ch)) {
+                    const top = stack.pop();
+                    if (!top) { issues.push(`Linha ${rec.num}: "${ch}" sem abertura correspondente.`); }
+                    else if (top.ch !== pairs[ch]) { issues.push(`Linha ${rec.num}: "${ch}" fecha "${top.ch}" aberto na linha ${top.line}.`); }
                 }
             }
         }
-        
-        const blockEnd = this.#findBlockEnd(tokens, blockStart, tokens.length - 1);
-        funcData.lineEnd = tokens[blockEnd].lineNum;
-        funcData.blockEnd = blockEnd + 1;
-        
-        return funcData;
+        for (const open of stack) issues.push(`Linha ${open.line}: "${open.ch}" nunca é fechado.`);
+
+        return { ok: issues.length === 0, issues, balanced: stack.length === 0 };
+    }
+}
+
+/* ============================================================================
+ * 7. FACHADA
+ * ========================================================================== */
+
+class CodeParser {
+    static #tree = null;
+    static #lastReport = null;
+
+    static parse(filePath) {
+        const code = fs.readFileSync(filePath, 'utf8');
+        this.#tree = StructureParser.parse(code, filePath);
+        return this.#tree;
     }
 
-    static #parseImport(statement) {
-        const m1 = statement.match(/import\s+(\w+)\s+from\s+['"](.+?)['"]/);
-        if (m1) return { type: 'default', name: m1[1], source: m1[2] };
-        
-        const m2 = statement.match(/import\s+\{\s*(.+?)\s*\}\s+from\s+['"](.+?)['"]/);
-        if (m2) return { type: 'named', names: m2[1].split(',').map(n => n.trim()), source: m2[2] };
-        
-        const m3 = statement.match(/import\s+\*\s+as\s+(\w+)\s+from\s+['"](.+?)['"]/);
-        if (m3) return { type: 'namespace', name: m3[1], source: m3[2] };
-        
-        return null;
+    static parseSource(code, filePath = '<memory>') {
+        this.#tree = StructureParser.parse(code, filePath);
+        return this.#tree;
     }
 
-    static #parseJSDoc(jsdoc) {
-        const tags = [];
-        const lines = jsdoc.split('\n');
-        for (const line of lines) {
-            const m = line.match(/@(\w+)\s*(.*)/);
-            if (m) tags.push({ tag: m[1], content: m[2].trim() });
-        }
-        return {
-            tags,
-            description: lines
-                .filter(l => !l.includes('@') && !l.includes('/*') && !l.includes('*/'))
-                .map(l => l.replace(/\s*\*\s?/, '').trim())
-                .filter(Boolean)
-                .join(' ')
-        };
+    static getTree() { return this.#tree; }
+    static getImports() { return this.#tree?.imports || []; }
+    static getExports() { return this.#tree?.exports || []; }
+    static getVariables() { return this.#tree?.variables || []; }
+    static getComments() { return this.#tree?.comments || []; }
+    static getJSDoc() { return this.#tree?.jsdoc || []; }
+
+    static getContainers(options = {}) {
+        let list = this.#tree?.containers || [];
+        if (options.kind) list = list.filter(c => c.kind === options.kind);
+        if (options.include) list = list.filter(c => options.include.includes(c.name));
+        if (options.exclude) list = list.filter(c => !options.exclude.includes(c.name));
+        return list;
     }
 
-    static getSummary() {
-        if (!this.#parsedTree) return null;
-        
-        let totalMethods = 0;
-        let totalMethodChars = 0;
-        
-        for (const cls of this.#parsedTree.classes) {
-            const allItems = [
-                ...(cls.methods || []),
-                ...(cls.staticMethods || []),
-                ...(cls.getters || []),
-                ...(cls.setters || []),
-                ...(cls.constructorProps || []),
-                ...(cls.properties || []),
-                ...(cls.assignments || []),
-                ...(cls.constructor ? [cls.constructor] : [])
-            ];
-            totalMethods += allItems.length;
-            for (const item of allItems) {
-                totalMethodChars += (item.charCount || 0);
+    static getClasses(options = {}) {
+        return this.getContainers({
+            include: options.includeClasses,
+            exclude: options.excludeClasses,
+            kind: options.kind
+        });
+    }
+
+    static getFunctions(options = {}) {
+        let list = this.#tree?.functions || [];
+        if (options.includeFunctions) list = list.filter(f => options.includeFunctions.includes(f.name));
+        if (options.excludeFunctions) list = list.filter(f => !options.excludeFunctions.includes(f.name));
+        return list;
+    }
+
+    static getMembers(options = {}) {
+        const out = [];
+        for (const container of this.getClasses(options)) {
+            for (const member of Selection.allMembers(container)) {
+                if (options.includeMembers && !options.includeMembers.includes(member.id)) continue;
+                if (options.excludeMembers && options.excludeMembers.includes(member.id)) continue;
+                if (options.includeMethods && !options.includeMethods.includes(member.name)) continue;
+                if (options.excludeMethods && options.excludeMethods.includes(member.name)) continue;
+                out.push({ ...member, className: container.name });
             }
         }
-        
-        let totalFunctionChars = 0;
-        for (const func of this.#parsedTree.functions) {
-            totalFunctionChars += (func.charCount || 0);
+        return out;
+    }
+
+    static getMethods(options = {}) { return this.getMembers(options); }
+
+    static generateFiltered(selection = {}) {
+        if (!this.#tree) return '';
+        this.#lastReport = CodeEmitter.generate(this.#tree, selection);
+        return this.#lastReport.text;
+    }
+
+    static getLastReport() { return this.#lastReport; }
+
+    static validate(text) { return CodeEmitter.validate(text); }
+
+    static getSummary() {
+        if (!this.#tree) return null;
+        const t = this.#tree;
+
+        const sum = (arr) => arr.reduce((acc, x) => acc + (x.charCount || 0), 0);
+        let totalMembers = 0;
+        let totalMemberChars = 0;
+        for (const container of t.containers) {
+            const members = Selection.allMembers(container);
+            totalMembers += members.length;
+            totalMemberChars += sum(members);
         }
-        
-        let totalImportChars = 0;
-        for (const imp of this.#parsedTree.imports) {
-            totalImportChars += (imp.charCount || 0);
-        }
-        
-        let totalExportChars = 0;
-        for (const exp of this.#parsedTree.exports) {
-            totalExportChars += (exp.charCount || 0);
-        }
-        
-        let totalVarChars = 0;
-        for (const v of this.#parsedTree.variables) {
-            totalVarChars += (v.charCount || 0);
-        }
-        
-        let totalCommentChars = 0;
-        for (const c of this.#parsedTree.comments) {
-            totalCommentChars += (c.charCount || 0);
-        }
-        
-        let totalJSDocChars = 0;
-        for (const j of this.#parsedTree.jsdoc) {
-            totalJSDocChars += (j.charCount || 0);
-        }
-        
+
         return {
-            filePath: this.#parsedTree.filePath,
-            totalLines: this.#parsedTree.raw.totalLines,
-            totalChars: this.#parsedTree.raw.totalChars,
-            imports: this.#parsedTree.imports.length,
-            importsChars: totalImportChars,
-            exports: this.#parsedTree.exports.length,
-            exportsChars: totalExportChars,
-            classes: this.#parsedTree.classes.length,
-            functions: this.#parsedTree.functions.length,
-            functionsChars: totalFunctionChars,
-            variables: this.#parsedTree.variables.length,
-            variablesChars: totalVarChars,
-            comments: this.#parsedTree.comments.length,
-            commentsChars: totalCommentChars,
-            jsdoc: this.#parsedTree.jsdoc.length,
-            jsdocChars: totalJSDocChars,
-            totalMethods,
-            totalMethodChars
+            filePath: t.filePath,
+            totalLines: t.raw.totalLines,
+            totalChars: t.raw.totalChars,
+            imports: t.imports.length,
+            importsChars: sum(t.imports),
+            exports: t.exports.length,
+            exportsChars: sum(t.exports),
+            containers: t.containers.length,
+            classes: t.containers.filter(c => c.kind === 'class').length,
+            interfaces: t.containers.filter(c => c.kind === 'interface').length,
+            enums: t.containers.filter(c => c.kind === 'enum').length,
+            containersChars: sum(t.containers),
+            functions: t.functions.length,
+            functionsChars: sum(t.functions),
+            variables: t.variables.length,
+            variablesChars: sum(t.variables),
+            comments: t.comments.length,
+            commentsChars: sum(t.comments),
+            jsdoc: t.jsdoc.length,
+            jsdocChars: sum(t.jsdoc),
+            totalMembers,
+            totalMemberChars,
+            totalMethods: totalMembers,
+            totalMethodChars: totalMemberChars
         };
     }
 
-    // Save and load selection state
     static saveSelection(selection, filePath) {
         fs.writeFileSync(filePath, JSON.stringify(selection, null, 2), 'utf8');
         return filePath;
@@ -1016,57 +1475,67 @@ class CodeParser {
 
     static loadSelection(filePath) {
         if (!fs.existsSync(filePath)) return null;
-        const data = fs.readFileSync(filePath, 'utf8');
-        return JSON.parse(data);
+        return Selection.normalize(JSON.parse(fs.readFileSync(filePath, 'utf8')), this.#tree);
     }
 }
 
-// CLI Interface
+/* ============================================================================
+ * 8. CLI
+ * ========================================================================== */
+
 class CLIMenu {
     constructor() {
         this.rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        this.sel = {
-            includeImports: false, includeExports: false,
-            includeClasses: [], includeMethods: [],
-            includeFunctions: [], includeVariables: false,
-            includeAllComments: false, includeAllJSDoc: false
-        };
+        this.sel = Selection.empty();
         this.outputPath = null;
+
+        this.eof = false;
+        this.queue = [];
+        this.waiting = [];
+        this.rl.on('line', (line) => {
+            const resolve = this.waiting.shift();
+            if (resolve) resolve(line);
+            else this.queue.push(line);
+        });
+        this.rl.on('close', () => {
+            this.eof = true;
+            while (this.waiting.length) this.waiting.shift()('');
+        });
     }
 
     async start(filePath, options = {}) {
-        console.clear();
-        console.log('════════════ CODE PARSER v5.0 ════════════\n');
+        this.#clear();
+        console.log('════════════ CODE PARSER v6.0 ════════════\n');
         try {
             CodeParser.parse(filePath);
             const s = CodeParser.getSummary();
             console.log(`File: ${path.basename(filePath)}`);
-            console.log(`Stats: ${s.totalLines} lines | ${s.totalChars} chars | ${s.classes} classes | ${s.totalMethods} methods | ${s.functions} functions\n`);
-            
-            // Load selection if provided
+            console.log(`Stats: ${s.totalLines} lines | ${s.totalChars} chars | ${s.containers} containers | ${s.totalMembers} members | ${s.functions} functions\n`);
+
             if (options.load) {
                 const loaded = CodeParser.loadSelection(options.load);
                 if (loaded) {
-                    this.sel = { ...this.sel, ...loaded };
+                    this.sel = loaded;
                     console.log(`Loaded selection: ${options.load}`);
+                } else {
+                    console.log(`Selection not found: ${options.load}`);
                 }
             }
-            
-            // Set output path if provided
-            if (options.output) {
-                this.outputPath = options.output;
-            }
-            
-            // Auto-generate if requested
+            if (options.commentMode) this.sel.commentMode = options.commentMode;
+            if (options.jsdocMode) this.sel.jsdocMode = options.jsdocMode;
+            if (options.output) this.outputPath = options.output;
+
             if (options.auto) {
-                await this.generateFile(true);
+                await this.generateFile();
+                this.rl.close();
                 return;
             }
-            
+
             await this.menu();
         } catch (e) {
             console.error(`Error: ${e.message}`);
             console.error(e.stack);
+            this.rl.close();
             process.exit(1);
         }
     }
@@ -1074,22 +1543,23 @@ class CLIMenu {
     async menu() {
         while (true) {
             console.log('\n─── MAIN MENU ───────────────────────────');
-            console.log('1. Imports      2. Exports      3. Classes');
-            console.log('4. Methods      5. Functions    6. Variables');
+            console.log('1. Imports      2. Exports      3. Classes/Interfaces');
+            console.log('4. Members      5. Functions    6. Variables');
             console.log('7. Comments     8. Preview      9. Save File');
             console.log('S. Save State   L. Load State   0. Exit');
             console.log('──────────────────────────────────────────');
-            const c = await this.ask('Choose option: ');
-            switch (c.toLowerCase()) {
+            const c = (await this.ask('Choose option: ')).trim().toLowerCase();
+            if (this.eof && !c) { console.log('\n(fim da entrada)'); this.rl.close(); return; }
+            switch (c) {
                 case '1': await this.imports(); break;
                 case '2': await this.exports(); break;
-                case '3': await this.classes(); break;
-                case '4': await this.methods(); break;
+                case '3': await this.containers(); break;
+                case '4': await this.members(); break;
                 case '5': await this.functions(); break;
                 case '6': await this.variables(); break;
                 case '7': await this.comments(); break;
                 case '8': await this.preview(); break;
-                case '9': await this.generateFile(false); break;
+                case '9': await this.generateFile(); break;
                 case 's': await this.saveState(); break;
                 case 'l': await this.loadState(); break;
                 case '0': console.log('\nGoodbye!'); this.rl.close(); return;
@@ -1099,349 +1569,406 @@ class CLIMenu {
     }
 
     async imports() {
-        console.clear();
+        this.#clear();
         const imps = CodeParser.getImports();
         console.log('─── IMPORTS ──────────────────────────────');
-        if (imps.length === 0) {
-            console.log('  No imports found');
-        } else {
-            imps.forEach((imp, i) => console.log(`  ${i+1}. ${imp.name || imp.names?.join(',')} from '${imp.source}' (${imp.charCount} chars)`));
-            const total = imps.reduce((s, imp) => s + (imp.charCount||0), 0);
-            console.log(`  Total: ${imps.length} imports, ${total} chars`);
+        if (!imps.length) console.log('  No imports found');
+        else {
+            imps.forEach((imp, i) => {
+                const label = imp.name || imp.names?.join(', ') || '(side-effect)';
+                console.log(`  ${i + 1}. [${imp.kind}] ${label} | lines ${imp.lineStart}-${imp.lineEnd} | ${imp.charCount} chars`);
+            });
+            console.log(`  Total: ${imps.length} imports, ${imps.reduce((s, x) => s + x.charCount, 0)} chars`);
         }
         console.log(`\nStatus: ${this.sel.includeImports ? 'INCLUDED' : 'EXCLUDED'}`);
-        const c = await this.ask('Toggle inclusion? (y/n): ');
-        if (c.toLowerCase() === 'y') this.sel.includeImports = !this.sel.includeImports;
+        if ((await this.ask('Toggle inclusion? (y/n): ')).toLowerCase() === 'y') {
+            this.sel.includeImports = !this.sel.includeImports;
+        }
     }
 
     async exports() {
-        console.clear();
+        this.#clear();
         const exps = CodeParser.getExports();
         console.log('─── EXPORTS ──────────────────────────────');
-        if (exps.length === 0) {
-            console.log('  No exports found');
-        } else {
-            exps.forEach((e, i) => console.log(`  ${i+1}. [${e.type}] ${e.statement.substring(0,60)} (${e.charCount} chars)`));
-            const total = exps.reduce((s, e) => s + (e.charCount||0), 0);
-            console.log(`  Total: ${exps.length} exports, ${total} chars`);
+        if (!exps.length) console.log('  No standalone exports found');
+        else {
+            exps.forEach((e, i) => console.log(`  ${i + 1}. [${e.kind}] ${e.statement.substring(0, 60)} | lines ${e.lineStart}-${e.lineEnd} | ${e.charCount} chars`));
+            console.log(`  Total: ${exps.length} exports, ${exps.reduce((s, x) => s + x.charCount, 0)} chars`);
         }
         console.log(`\nStatus: ${this.sel.includeExports ? 'INCLUDED' : 'EXCLUDED'}`);
-        const c = await this.ask('Toggle inclusion? (y/n): ');
-        if (c.toLowerCase() === 'y') this.sel.includeExports = !this.sel.includeExports;
+        if ((await this.ask('Toggle inclusion? (y/n): ')).toLowerCase() === 'y') {
+            this.sel.includeExports = !this.sel.includeExports;
+        }
     }
 
-    async classes() {
-        let keepSelecting = true;
-        while (keepSelecting) {
-            console.clear();
-            const cls = CodeParser.getClasses();
-            console.log('─── CLASSES ──────────────────────────────');
-            if (cls.length === 0) {
-                console.log('  No classes found');
+    async containers() {
+        while (true) {
+            this.#clear();
+            const list = CodeParser.getContainers();
+            console.log('─── CLASSES / INTERFACES / ENUMS ─────────');
+            if (!list.length) {
+                console.log('  None found');
                 await this.ask('\nPress Enter to continue...');
                 return;
             }
-            cls.forEach((c, i) => {
-                const selected = this.sel.includeClasses.includes(c.name) ? '[x]' : '[ ]';
-                const m = (c.methods?.length||0)+(c.staticMethods?.length||0)+(c.getters?.length||0)+
-                         (c.setters?.length||0)+(c.constructorProps?.length||0)+(c.properties?.length||0)+
-                         (c.assignments?.length||0)+(c.constructor?1:0);
-                console.log(`  ${selected} ${i+1}. ${c.name} | ${m} members | ${c.charCount} chars`);
-                if (c.extends) console.log(`      extends: ${c.extends}`);
-                if (c.constructorProps?.length) console.log(`      constructor props: ${c.constructorProps.map(p=>`${p.name}(${p.charCount}c)`).join(', ')}`);
-                if (c.assignments?.length) console.log(`      assignments: ${c.assignments.map(p=>`${p.name}(${p.charCount}c)`).join(', ')}`);
+
+            list.forEach((c, i) => {
+                const selected = Selection.isContainerSelected(this.sel, c.name) ? '[x]' : '[ ]';
+                const total = Selection.allMembers(c).length;
+                const entry = this.sel.containers[c.name];
+                const active = entry ? (entry.members === null ? total : entry.members.length) : 0;
+                const filter = entry && entry.members !== null ? ` | filtered ${active}/${total}` : '';
+                console.log(`  ${selected} ${i + 1}. ${c.kind} ${c.name} | ${total} members | ${c.charCount} chars | lines ${c.lineStart}-${c.lineEnd}${filter}`);
+                if (c.extends) console.log(`        extends ${c.extends}`);
+                if (c.implements.length) console.log(`        implements ${c.implements.join(', ')}`);
             });
-            console.log('\nCommands: <number> = toggle | all = select all | none = deselect all | done = back');
-            const c = await this.ask('> ');
-            if (c === 'all') this.sel.includeClasses = cls.map(cl => cl.name);
-            else if (c === 'none') this.sel.includeClasses = [];
-            else if (c === 'done') keepSelecting = false;
-            else {
-                const idx = parseInt(c)-1;
-                if (cls[idx]) {
-                    const n = cls[idx].name;
-                    if (this.sel.includeClasses.includes(n)) this.sel.includeClasses = this.sel.includeClasses.filter(x => x!==n);
-                    else this.sel.includeClasses.push(n);
-                }
+
+            console.log('\nCommands: <n> | 1,3,5 | 2-6 | all | none | done');
+            const cmd = (await this.ask('> ')).trim().toLowerCase();
+            if (cmd === 'done' || cmd === '') return;
+            if (cmd === 'all') { list.forEach(c => { if (!Selection.isContainerSelected(this.sel, c.name)) this.sel.containers[c.name] = { members: null }; }); continue; }
+            if (cmd === 'none') { this.sel.containers = {}; continue; }
+
+            for (const idx of this.#parseIndexes(cmd, list.length)) {
+                Selection.toggleContainer(this.sel, list[idx]);
             }
         }
     }
 
-    async methods() {
-        if (!this.sel.includeClasses.length) { 
-            console.log('\nPlease select at least one class first (option 3)'); 
-            await this.ask('Press Enter to continue...'); 
-            return; 
+    async members() {
+        const names = Object.keys(this.sel.containers);
+        if (!names.length) {
+            console.log('\nSelect at least one class/interface first (option 3).');
+            await this.ask('Press Enter to continue...');
+            return;
         }
-        let keepSelecting = true;
-        while (keepSelecting) {
-            console.clear();
-            const mtds = CodeParser.getMethods({ includeClasses: this.sel.includeClasses });
-            console.log('─── METHODS & MEMBERS ────────────────────');
-            const grouped = {};
-            mtds.forEach(m => { if (!grouped[m.className]) grouped[m.className] = []; grouped[m.className].push(m); });
-            let cnt = 1;
-            const list = [];
-            for (const [cn, ms] of Object.entries(grouped)) {
-                const classTotal = ms.reduce((s, m) => s + (m.charCount||0), 0);
-                console.log(`\n  Class: ${cn} (${ms.length} members, ${classTotal} chars)`);
-                ms.forEach(m => {
-                    const selected = this.sel.includeMethods.includes(m.name) ? '[x]' : '[ ]';
-                    let display;
-                    switch (m.type) {
-                        case 'constructor': display = `constructor() (${m.charCount}c)`; break;
-                        case 'constructor-prop': display = `[ctor] this.${m.name} = ... (${m.charCount}c)`; break;
-                        case 'assignment': display = `[assign] ${m.isStatic?'static ':''}${m.name} = ... (${m.charCount}c)`; break;
-                        case 'property': display = `[prop] ${m.name} (${m.charCount}c)`; break;
-                        case 'getter': display = `${m.isStatic?'static ':''}get ${m.name}() (${m.charCount}c)`; break;
-                        case 'setter': display = `${m.isStatic?'static ':''}set ${m.name}() (${m.charCount}c)`; break;
-                        default: display = `${m.isStatic?'static ':''}${m.isAsync?'async ':''}${m.name}() (${m.charCount}c)`; break;
+
+        while (true) {
+            this.#clear();
+            console.log('─── MEMBERS ──────────────────────────────');
+            console.log('Marcados = MANTIDOS na saída. Desmarque para EXCLUIR.\n');
+
+            const rows = [];
+            let n = 1;
+
+            for (const name of names) {
+                const container = CodeParser.getContainers({ include: [name] })[0];
+                if (!container) continue;
+
+                const members = container.members;
+                const props = members.reduce((s, m) => s + m.children.length, 0);
+                const totalChars = members.reduce((s, m) => s + m.charCount, 0);
+                const extra = props ? ` + ${props} ctor props` : '';
+                console.log(`  ${container.kind} ${container.name} (${members.length} members${extra}, ${totalChars} chars)`);
+
+                if (!members.length) console.log('      (no members detected)');
+
+                for (const member of members) {
+                    const mark = Selection.isMemberSelected(this.sel, container, member.id) ? '[x]' : '[ ]';
+                    console.log(`    ${mark} ${n}. ${this.#memberLabel(member)}`);
+                    rows.push({ container, member });
+                    n++;
+
+                    for (const child of member.children) {
+                        const cmark = Selection.isMemberSelected(this.sel, container, child.id) ? '[x]' : '[ ]';
+                        console.log(`        ${cmark} ${n}. └─ this.${child.name} = ... (${child.charCount}c, L${child.lineStart})`);
+                        rows.push({ container, member: child });
+                        n++;
                     }
-                    console.log(`    ${selected} ${cnt}. ${display}`);
-                    list.push(m);
-                    cnt++;
-                });
-            }
-            if (!list.length) { 
-                console.log('\n  No members found'); 
-                await this.ask('Press Enter to continue...'); 
-                return; 
-            }
-            const totalChars = list.reduce((s, m) => s + (m.charCount||0), 0);
-            console.log(`\n  Total: ${list.length} members, ${totalChars} chars`);
-            console.log('Commands: <number> = toggle | all = select all | none = deselect all | done = back');
-            const c = await this.ask('> ');
-            if (c === 'all') this.sel.includeMethods = [...new Set(mtds.map(m=>m.name))];
-            else if (c === 'none') this.sel.includeMethods = [];
-            else if (c === 'done') keepSelecting = false;
-            else {
-                const idx = parseInt(c)-1;
-                if (list[idx]) {
-                    const n = list[idx].name;
-                    if (this.sel.includeMethods.includes(n)) this.sel.includeMethods = this.sel.includeMethods.filter(x=>x!==n);
-                    else this.sel.includeMethods.push(n);
                 }
+                console.log('');
+            }
+
+            if (!rows.length) {
+                console.log('  No members found in the selected containers.');
+                await this.ask('Press Enter to continue...');
+                return;
+            }
+
+            const kept = rows.filter(r => Selection.isMemberSelected(this.sel, r.container, r.member.id));
+            console.log(`  Kept: ${kept.length}/${rows.length} members | ${kept.reduce((s, r) => s + r.member.charCount, 0)} chars`);
+            console.log('Commands: <n> | 1,3,5 | 2-6 | all | none | inv | done');
+
+            const cmd = (await this.ask('> ')).trim().toLowerCase();
+            if (cmd === 'done' || cmd === '') return;
+
+            if (cmd === 'all') {
+                for (const name of names) this.sel.containers[name].members = null;
+                continue;
+            }
+            if (cmd === 'none') {
+                for (const name of names) this.sel.containers[name].members = [];
+                continue;
+            }
+            if (cmd === 'inv') {
+                for (const name of names) {
+                    const container = CodeParser.getContainers({ include: [name] })[0];
+                    if (!container) continue;
+                    const all = Selection.allMemberIds(container);
+                    const current = this.sel.containers[name].members;
+                    this.sel.containers[name].members = current === null ? [] : all.filter(id => !current.includes(id));
+                }
+                continue;
+            }
+
+            for (const idx of this.#parseIndexes(cmd, rows.length)) {
+                Selection.toggleMember(this.sel, rows[idx].container, rows[idx].member.id);
             }
         }
     }
 
     async functions() {
-        let keepSelecting = true;
-        while (keepSelecting) {
-            console.clear();
+        while (true) {
+            this.#clear();
             const fns = CodeParser.getFunctions();
             console.log('─── FUNCTIONS ────────────────────────────');
-            if (fns.length === 0) {
+            if (!fns.length) {
                 console.log('  No functions found');
                 await this.ask('\nPress Enter to continue...');
                 return;
             }
             fns.forEach((f, i) => {
-                const selected = this.sel.includeFunctions.includes(f.name) ? '[x]' : '[ ]';
-                console.log(`  ${selected} ${i+1}. ${f.isAsync?'async ':''}${f.name}(${f.params?.map(p=>p.name).join(',')||''}) | ${f.charCount} chars`);
+                const mark = this.sel.functions.includes(f.name) ? '[x]' : '[ ]';
+                const params = f.params?.map(p => p.name).join(', ') || '';
+                console.log(`  ${mark} ${i + 1}. ${f.isAsync ? 'async ' : ''}${f.name}(${params}) [${f.form}] | ${f.charCount} chars | lines ${f.lineStart}-${f.lineEnd}`);
             });
-            const total = fns.reduce((s, f) => s + (f.charCount||0), 0);
-            console.log(`  Total: ${fns.length} functions, ${total} chars`);
-            console.log('Commands: <number> = toggle | all = select all | none = deselect all | done = back');
-            const c = await this.ask('> ');
-            if (c === 'all') this.sel.includeFunctions = fns.map(f=>f.name);
-            else if (c === 'none') this.sel.includeFunctions = [];
-            else if (c === 'done') keepSelecting = false;
-            else {
-                const idx = parseInt(c)-1;
-                if (fns[idx]) {
-                    const n = fns[idx].name;
-                    if (this.sel.includeFunctions.includes(n)) this.sel.includeFunctions = this.sel.includeFunctions.filter(x=>x!==n);
-                    else this.sel.includeFunctions.push(n);
-                }
+            console.log(`  Total: ${fns.length} functions, ${fns.reduce((s, f) => s + f.charCount, 0)} chars`);
+            console.log('\nCommands: <n> | 1,3,5 | 2-6 | all | none | done');
+
+            const cmd = (await this.ask('> ')).trim().toLowerCase();
+            if (cmd === 'done' || cmd === '') return;
+            if (cmd === 'all') { this.sel.functions = fns.map(f => f.name); continue; }
+            if (cmd === 'none') { this.sel.functions = []; continue; }
+
+            for (const idx of this.#parseIndexes(cmd, fns.length)) {
+                const name = fns[idx].name;
+                this.sel.functions = this.sel.functions.includes(name)
+                    ? this.sel.functions.filter(x => x !== name)
+                    : [...this.sel.functions, name];
             }
         }
     }
 
     async variables() {
-        console.clear();
+        this.#clear();
         const vars = CodeParser.getVariables();
         console.log('─── VARIABLES ────────────────────────────');
-        if (vars.length === 0) {
-            console.log('  No variables found');
-        } else {
-            vars.forEach((v, i) => console.log(`  ${i+1}. [${v.kind}] ${v.declaration.substring(0,60)} (${v.charCount} chars)`));
-            const total = vars.reduce((s, v) => s + (v.charCount||0), 0);
-            console.log(`  Total: ${vars.length} variables, ${total} chars`);
+        if (!vars.length) console.log('  No variables found');
+        else {
+            vars.forEach((v, i) => console.log(`  ${i + 1}. [${v.kind}] ${v.declaration.substring(0, 60)} | lines ${v.lineStart}-${v.lineEnd} | ${v.charCount} chars`));
+            console.log(`  Total: ${vars.length} variables, ${vars.reduce((s, v) => s + v.charCount, 0)} chars`);
         }
         console.log(`\nStatus: ${this.sel.includeVariables ? 'INCLUDED' : 'EXCLUDED'}`);
-        const c = await this.ask('Toggle inclusion? (y/n): ');
-        if (c.toLowerCase() === 'y') this.sel.includeVariables = !this.sel.includeVariables;
+        if ((await this.ask('Toggle inclusion? (y/n): ')).toLowerCase() === 'y') {
+            this.sel.includeVariables = !this.sel.includeVariables;
+        }
     }
 
     async comments() {
-        console.clear();
-        const cmts = CodeParser.getComments();
-        const jsdocs = CodeParser.getJSDoc();
-        const cmtChars = cmts.reduce((s, c) => s + (c.charCount||0), 0);
-        const jsdChars = jsdocs.reduce((s, j) => s + (j.charCount||0), 0);
-        console.log('─── COMMENTS & JSDOC ─────────────────────');
-        console.log(`  1. All Comments: ${this.sel.includeAllComments ? 'INCLUDED' : 'EXCLUDED'} (${cmts.length} comments, ${cmtChars} chars)`);
-        console.log(`  2. All JSDoc: ${this.sel.includeAllJSDoc ? 'INCLUDED' : 'EXCLUDED'} (${jsdocs.length} jsdocs, ${jsdChars} chars)`);
-        const c = await this.ask('Toggle which? (1=Comments, 2=JSDoc, Enter=back): ');
-        if (c === '1') this.sel.includeAllComments = !this.sel.includeAllComments;
-        if (c === '2') this.sel.includeAllJSDoc = !this.sel.includeAllJSDoc;
+        while (true) {
+            this.#clear();
+            const cmts = CodeParser.getComments();
+            const docs = CodeParser.getJSDoc();
+            const cTop = cmts.filter(c => c.depth === 0).length;
+            const dTop = docs.filter(d => d.depth === 0).length;
+
+            console.log('─── COMMENTS & JSDOC ─────────────────────');
+            console.log(`  Comments: ${cmts.length} total (${cTop} na camada principal, ${cmts.length - cTop} aninhados) | ${cmts.reduce((s, c) => s + c.charCount, 0)} chars`);
+            console.log(`  JSDoc:    ${docs.length} total (${dTop} na camada principal, ${docs.length - dTop} aninhados) | ${docs.reduce((s, d) => s + d.charCount, 0)} chars`);
+            console.log('');
+            console.log(`  1. Comments mode: ${MODE_LABEL[this.sel.commentMode]}`);
+            console.log(`  2. JSDoc mode:    ${MODE_LABEL[this.sel.jsdocMode]}`);
+            console.log('');
+            console.log('Commands: 1, 2 | done');
+
+            const cmd = (await this.ask('> ')).trim().toLowerCase();
+            if (cmd === 'done' || cmd === '') return;
+
+            if (cmd === '1') {
+                const idx = COMMENT_MODES.indexOf(this.sel.commentMode);
+                this.sel.commentMode = COMMENT_MODES[(idx + 1) % COMMENT_MODES.length];
+            } else if (cmd === '2') {
+                const idx = COMMENT_MODES.indexOf(this.sel.jsdocMode);
+                this.sel.jsdocMode = COMMENT_MODES[(idx + 1) % COMMENT_MODES.length];
+            }
+        }
     }
 
     async preview() {
-        console.clear();
-        console.log('─── CURRENT SELECTION ────────────────────');
-        console.log(`Imports: ${this.sel.includeImports ? 'Yes' : 'No'} | Exports: ${this.sel.includeExports ? 'Yes' : 'No'} | Variables: ${this.sel.includeVariables ? 'Yes' : 'No'}`);
-        console.log(`Classes: [${this.sel.includeClasses.join(', ') || 'none'}]`);
-        console.log(`Methods: [${this.sel.includeMethods.join(', ') || 'none'}]`);
-        console.log(`Functions: [${this.sel.includeFunctions.join(', ') || 'none'}]`);
-        console.log(`Comments: ${this.sel.includeAllComments ? 'Yes' : 'No'} | JSDoc: ${this.sel.includeAllJSDoc ? 'Yes' : 'No'}`);
+        this.#clear();
+        console.log('─── PREVIEW ──────────────────────────────');
+        const result = CodeEmitter.generate(CodeParser.getTree(), this.sel);
         
-        const filtered = CodeParser.generateFiltered(this.sel);
-        const nonEmptyLines = filtered.split('\n').filter(l => l.trim()).length;
-        const totalLines = filtered.split('\n').length;
-        console.log(`\n─── PREVIEW ──────────────────────────────`);
-        console.log(`Output: ${nonEmptyLines} non-empty lines (${totalLines} total) | ${filtered.length} chars`);
-        console.log('──────────────────────────────────────────');
-        const previewLines = filtered.split('\n');
-        const maxPreview = Math.min(15, previewLines.length);
-        for (let i = 0; i < maxPreview; i++) {
-            console.log(previewLines[i]);
+        if (result.notes.length) {
+            console.log('\nNotes:');
+            result.notes.forEach(n => console.log(`  • ${n}`));
         }
-        if (previewLines.length > maxPreview) {
-            console.log(`... and ${previewLines.length - maxPreview} more lines`);
+        
+        if (!result.validation.ok) {
+            console.log('\n⚠️  VALIDATION ISSUES:');
+            result.validation.issues.forEach(i => console.log(`  • ${i}`));
         }
-        console.log('──────────────────────────────────────────');
-        await this.ask('Press Enter to continue...');
+
+        console.log('\n' + (result.text || '(empty output)'));
+        await this.ask('\nPress Enter to continue...');
     }
 
-    async generateFile(silent = false) {
-        if (!silent) console.clear();
-        const filtered = CodeParser.generateFiltered(this.sel);
+    async generateFile() {
+        if (!this.outputPath) {
+            this.outputPath = await this.ask('Output file path: ');
+        }
+        if (!this.outputPath) {
+            console.log('No output path specified.');
+            return;
+        }
+
+        const result = CodeEmitter.generate(CodeParser.getTree(), this.sel);
         
-        if (!filtered.trim()) {
-            console.log('Warning: No content selected. Generated file would be empty.');
-            const c = await this.ask('Continue anyway? (y/n): ');
-            if (c.toLowerCase() !== 'y') return;
+        this.#clear();
+        console.log('─── SAVE FILE ────────────────────────────');
+        
+        if (result.notes.length) {
+            console.log('\nNotes:');
+            result.notes.forEach(n => console.log(`  • ${n}`));
         }
         
-        // Determine output path
-        let outputPath = this.outputPath;
-        if (!outputPath) {
-            const tree = CodeParser.getTree();
-            outputPath = tree.filePath.replace(/\.js$/, '.filtered.js');
-            if (outputPath === tree.filePath) {
-                outputPath = tree.filePath + '.filtered.js';
-            }
+        if (!result.validation.ok) {
+            console.log('\n⚠️  VALIDATION ISSUES (file may have errors):');
+            result.validation.issues.forEach(i => console.log(`  • ${i}`));
         }
+
+        fs.writeFileSync(this.outputPath, result.text, 'utf8');
         
-        // Ensure directory exists
-        const dir = path.dirname(outputPath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
+        const stats = fs.statSync(this.outputPath);
+        console.log(`\nSaved: ${this.outputPath}`);
+        console.log(`Size: ${stats.size} bytes | ${result.text.split('\n').length} lines`);
         
-        fs.writeFileSync(outputPath, filtered, 'utf8');
-        const nonEmptyLines = filtered.split('\n').filter(l => l.trim()).length;
-        const totalLines = filtered.split('\n').length;
-        
-        console.log('\n─── FILE SAVED ───────────────────────────');
-        console.log(`Path: ${outputPath}`);
-        console.log(`Stats: ${nonEmptyLines} non-empty lines (${totalLines} total) | ${filtered.length} chars`);
-        console.log('──────────────────────────────────────────');
-        
-        if (!silent) {
-            await this.ask('Press Enter to continue...');
-        }
-        
-        return outputPath;
+        await this.ask('\nPress Enter to continue...');
     }
 
     async saveState() {
-        console.clear();
-        console.log('─── SAVE SELECTION STATE ─────────────────');
-        const defaultPath = CodeParser.getTree().filePath.replace(/\.js$/, '.selection.json');
-        const c = await this.ask(`Save path [${defaultPath}]: `);
-        const savePath = c.trim() || defaultPath;
-        
-        try {
-            CodeParser.saveSelection(this.sel, savePath);
-            console.log(`Selection saved to: ${savePath}`);
-            console.log(`Contents: ${JSON.stringify(this.sel, null, 2)}`);
-        } catch (e) {
-            console.log(`Error saving: ${e.message}`);
-        }
-        await this.ask('Press Enter to continue...');
+        const defaultPath = path.join(process.cwd(), 'codeparser-state.json');
+        const filePath = await this.ask(`State file path (default: ${defaultPath}): `) || defaultPath;
+        CodeParser.saveSelection(this.sel, filePath);
+        console.log(`State saved to ${filePath}`);
+        await this.ask('\nPress Enter to continue...');
     }
 
     async loadState() {
-        console.clear();
-        console.log('─── LOAD SELECTION STATE ─────────────────');
-        const defaultPath = CodeParser.getTree().filePath.replace(/\.js$/, '.selection.json');
-        const c = await this.ask(`Load path [${defaultPath}]: `);
-        const loadPath = c.trim() || defaultPath;
+        const defaultPath = path.join(process.cwd(), 'codeparser-state.json');
+        const filePath = await this.ask(`State file path (default: ${defaultPath}): `) || defaultPath;
+        const loaded = CodeParser.loadSelection(filePath);
+        if (loaded) {
+            this.sel = loaded;
+            console.log(`State loaded from ${filePath}`);
+        } else {
+            console.log(`State not found: ${filePath}`);
+        }
+        await this.ask('\nPress Enter to continue...');
+    }
+
+    #clear() {
+        console.log('\n'.repeat(50));
+    }
+
+    #memberLabel(member) {
+        const mods = [];
+        if (member.accessibility) mods.push(member.accessibility);
+        if (member.isStatic) mods.push('static');
+        if (member.isAbstract) mods.push('abstract');
+        if (member.isAsync) mods.push('async');
+        if (member.isGenerator) mods.push('*');
+        if (member.isReadonly) mods.push('readonly');
         
-        try {
-            const loaded = CodeParser.loadSelection(loadPath);
-            if (loaded) {
-                this.sel = { ...this.sel, ...loaded };
-                console.log(`Selection loaded from: ${loadPath}`);
-                console.log(`Contents: ${JSON.stringify(this.sel, null, 2)}`);
-            } else {
-                console.log(`File not found: ${loadPath}`);
+        const prefix = mods.length ? mods.join(' ') + ' ' : '';
+        const params = member.params?.length ? `(${member.params.map(p => p.name).join(', ')})` : '';
+        
+        let label = `${prefix}${member.name}${params}`;
+        if (member.kind === 'constructor-prop') label = `this.${member.name} = ...`;
+        else if (member.kind === 'static-block') label = 'static { ... }';
+        else label = `${member.kind}: ${label}`;
+        
+        return `${label} | ${member.charCount}c, L${member.lineStart}`;
+    }
+
+    #parseIndexes(input, max) {
+        const result = new Set();
+        const parts = input.split(',');
+        
+        for (const part of parts) {
+            const range = part.split('-').map(s => s.trim()).filter(Boolean);
+            if (range.length === 2) {
+                const start = parseInt(range[0], 10);
+                const end = parseInt(range[1], 10);
+                if (!isNaN(start) && !isNaN(end)) {
+                    for (let i = Math.max(1, start); i <= Math.min(end, max); i++) {
+                        result.add(i - 1);
+                    }
+                }
+            } else if (range.length === 1) {
+                const idx = parseInt(range[0], 10);
+                if (!isNaN(idx) && idx >= 1 && idx <= max) {
+                    result.add(idx - 1);
+                }
             }
-        } catch (e) {
-            console.log(`Error loading: ${e.message}`);
         }
-        await this.ask('Press Enter to continue...');
+        
+        return [...result];
     }
 
-    ask(q) { return new Promise(r => this.rl.question(q, r)); }
+    ask(prompt) {
+        process.stdout.write(prompt);
+        if (this.queue.length) {
+            return Promise.resolve(this.queue.shift());
+        }
+        return new Promise(resolve => {
+            this.waiting.push(resolve);
+        });
+    }
 }
 
-export default CodeParser;
+/* ============================================================================
+ * 9. PONTO DE ENTRADA (CLI)
+ * ========================================================================== */
 
-// CLI execution
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
-    const args = process.argv.slice(2);
-    
-    if (args.length === 0) {
-        console.log('════════════ CODE PARSER v5.0 ════════════');
-        console.log('Usage:');
-        console.log('  node CodeParser.js <file.js>');
-        console.log('  node CodeParser.js <file.js> --output <out.js>');
-        console.log('  node CodeParser.js <file.js> --load <state.json>');
-        console.log('  node CodeParser.js <file.js> --auto --output <out.js>');
-        console.log('  node CodeParser.js <file.js> --load <state.json> --auto --output <out.js>');
-        console.log('\nOptions:');
-        console.log('  --output <path>   Set output file path');
-        console.log('  --load <path>     Load saved selection state');
-        console.log('  --auto            Auto-generate and exit (no interactive menu)');
-        process.exit(1);
-    }
-    
-    const filePath = args[0];
-    if (!fs.existsSync(filePath)) {
-        console.error(`Error: File not found: ${filePath}`);
-        process.exit(1);
-    }
-    
-    const options = {
-        output: null,
-        load: null,
-        auto: false
-    };
-    
-    for (let i = 1; i < args.length; i++) {
-        if (args[i] === '--output' && i + 1 < args.length) {
-            options.output = args[++i];
-        } else if (args[i] === '--load' && i + 1 < args.length) {
-            options.load = args[++i];
-        } else if (args[i] === '--auto') {
-            options.auto = true;
-        }
-    }
-    
-    const cli = new CLIMenu();
-    cli.start(filePath, options).catch(console.error);
+const args = process.argv.slice(2);
+const options = {
+    load: null,
+    output: null,
+    commentMode: null,
+    jsdocMode: null,
+    auto: false
+};
+
+let filePath = null;
+
+for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--load' || arg === '-l') options.load = args[++i];
+    else if (arg === '--output' || arg === '-o') options.output = args[++i];
+    else if (arg === '--comment-mode') options.commentMode = args[++i];
+    else if (arg === '--jsdoc-mode') options.jsdocMode = args[++i];
+    else if (arg === '--auto' || arg === '-a') options.auto = true;
+    else if (!filePath) filePath = arg;
 }
+
+if (!filePath || args.includes('--help') || args.includes('-h')) {
+    console.log(`
+Usage: node codeParser.js <file> [options]
+
+Options:
+  --load, -l <path>        Load selection state from file
+  --output, -o <path>      Output file path
+  --comment-mode <mode>    Set comment mode (keep|top-level|all)
+  --jsdoc-mode <mode>      Set JSDoc mode (keep|top-level|all)
+  --auto, -a               Auto-generate and exit (requires --output)
+  --help, -h               Show this help
+`);
+    process.exit(filePath ? 0 : 1);
+}
+
+const menu = new CLIMenu();
+menu.start(filePath, options).catch(err => {
+    console.error('Fatal error:', err);
+    process.exit(1);
+});

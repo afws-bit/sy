@@ -60,16 +60,18 @@ class Misc extends SyAPP.Func() {
                 }
 
                 this.Text(uid,'• Misc Menu')
+
+                await this.DropDown(uid,'devapps',async () => {
+                    this.Button(uid,'RacksLab',{path : 'rackslab'})
+                    this.Button(uid,'FastHTTP',{path : 'fasthttp'})
+                    this.Button(uid,{name : 'DownloadHUD',props : {downloadhub : true}})
+                },{up_buttontext : 'Dev Apps',down_buttontext : 'Dev Apps'})
                 
-                this.Button(uid,'RacksLab',{path : 'rackslab'})
-                this.Button(uid,'FastHTTP',{path : 'fasthttp'})
-                this.Button(uid,{name : 'DownloadHUD',props : {downloadhub : true}})
-                this.Button(uid,{name : 'Git Config',props : {gitconfig : true}})
                 await this.DropDown(uid,'windows-drop',async () => {
                     this.Button(uid,{name : 'Clip',props : {clip : true}})
                     this.Button(uid,{name :'WSL | Vscode save',props : {sudosave : true}})
-                },{up_buttontext : 'Windows Toolkit',down_buttontext : 'Windows Toolkit'})
-                
+                },{up_buttontext : 'WSL',down_buttontext : 'WSL'})
+                this.Button(uid,{name : 'Git Config',props : {gitconfig : true}})
                 this.Button(uid,{name : ' '})
                 this.Button(uid,{name : '← Return',path : 'config'})
 
