@@ -5,6 +5,7 @@ import os from 'os';
 import { tmpdir } from 'os';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import cluster from 'cluster';
 
 const __filename = fileURLToPath(import.meta.url);
 
@@ -32,6 +33,12 @@ const LOG_DIR = path.join(GLOBAL_BASE_DIR, 'logs');
  */
 const DAEMON_DIR = path.join(GLOBAL_BASE_DIR, 'daemons');
 
+/**
+ * Directory for cluster master logs
+ * @constant {string}
+ */
+const CLUSTER_LOG_DIR = path.join(GLOBAL_BASE_DIR, 'cluster_logs');
+
 // Ensure global directories exist
 if (!fs.existsSync(GLOBAL_BASE_DIR)) {
     fs.mkdirSync(GLOBAL_BASE_DIR, { recursive: true });
@@ -41,6 +48,9 @@ if (!fs.existsSync(LOG_DIR)) {
 }
 if (!fs.existsSync(DAEMON_DIR)) {
     fs.mkdirSync(DAEMON_DIR, { recursive: true });
+}
+if (!fs.existsSync(CLUSTER_LOG_DIR)) {
+    fs.mkdirSync(CLUSTER_LOG_DIR, { recursive: true });
 }
 if (!fs.existsSync(PROCESS_REGISTRY)) {
     fs.writeFileSync(PROCESS_REGISTRY, '[]', 'utf-8');
@@ -239,28 +249,92 @@ class SyPM {
         return killedCount > 0;
     }
 
-  /**
- * Checks if a process name is already in use and locked
- * @static
- * @private
- * @param {string} processName - Name to check
- * @param {boolean} uniqueNameLock - Whether unique name locking is enabled
- * @returns {boolean} True if name is already in use and locked
- */
-static _isNameLocked(processName, uniqueNameLock) {
-    if (!uniqueNameLock) {
-        return false;
+    /**
+     * Checks if a process name is already in use and locked
+     * @static
+     * @private
+     * @param {string} processName - Name to check
+     * @param {boolean} uniqueNameLock - Whether unique name locking is enabled
+     * @returns {boolean} True if name is already in use and locked
+     */
+    static _isNameLocked(processName, uniqueNameLock) {
+        if (!uniqueNameLock) {
+            return false;
+        }
+        
+        const registry = this._loadRegistry();
+        const existingProcess = registry.find(process => 
+            process.name === processName && 
+            process.config.uniqueNameLock === true &&
+            this.isAlive(process.id)
+        );
+        
+        return !!existingProcess;
+    }
+
+    /**
+     * Creates a cluster wrapper script for scaled processes
+     * @static
+     * @private
+     * @param {string} processId - Unique process identifier
+     * @param {string} filePath - Path to the script file
+     * @param {number} instances - Number of instances (0 = max CPUs)
+     * @param {string} logPath - Path to the log file
+     * @returns {string} Path to the created cluster wrapper script
+     */
+    static _createClusterWrapper(processId, filePath, instances, logPath) {
+        const numInstances = instances === 0 ? os.cpus().length : instances;
+        
+        const wrapperContent = `
+const cluster = require('cluster');
+const os = require('os');
+const path = require('path');
+
+const numCPUs = ${numInstances};
+const workerScript = '${filePath.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}';
+const logFile = '${logPath.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}';
+
+if (cluster.isMaster) {
+    const fs = require('fs');
+    const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+    
+    logStream.write(\`[Master \${process.pid}] Starting \${numCPUs} workers for: \${workerScript}\\n\`);
+    console.log(\`[Master \${process.pid}] Starting \${numCPUs} workers for: \${workerScript}\`);
+    
+    // Fork workers
+    for (let i = 0; i < numCPUs; i++) {
+        const worker = cluster.fork();
+        logStream.write(\`[Master \${process.pid}] Worker \${worker.process.pid} started (worker \${i + 1}/\${numCPUs})\\n\`);
+        console.log(\`[Master \${process.pid}] Worker \${worker.process.pid} started (worker \${i + 1}/\${numCPUs})\`);
     }
     
-    const registry = this._loadRegistry();
-    const existingProcess = registry.find(process => 
-        process.name === processName && 
-        process.config.uniqueNameLock === true &&
-        this.isAlive(process.id) // Only consider alive processes as locked
-    );
+    cluster.on('exit', (worker, code, signal) => {
+        logStream.write(\`[Master \${process.pid}] Worker \${worker.process.pid} died (code: \${code}, signal: \${signal}). Restarting...\\n\`);
+        console.log(\`[Master \${process.pid}] Worker \${worker.process.pid} died. Restarting...\`);
+        cluster.fork();
+    });
     
-    return !!existingProcess;
+    cluster.on('online', (worker) => {
+        logStream.write(\`[Master \${process.pid}] Worker \${worker.process.pid} is online\\n\`);
+    });
+    
+    process.on('SIGTERM', () => {
+        logStream.write(\`[Master \${process.pid}] Received SIGTERM, shutting down cluster...\\n\`);
+        for (const id in cluster.workers) {
+            cluster.workers[id].kill();
+        }
+        process.exit(0);
+    });
+} else {
+    // Worker process - run the actual application
+    require(workerScript);
 }
+`;
+
+        const wrapperPath = path.join(CLUSTER_LOG_DIR, `cluster_wrapper_${processId}.js`);
+        fs.writeFileSync(wrapperPath, wrapperContent, 'utf-8');
+        return wrapperPath;
+    }
 
     /**
      * Creates a monitor script for auto-restart processes
@@ -275,9 +349,10 @@ static _isNameLocked(processName, uniqueNameLock) {
      * @param {string} [workingDir] - Optional working directory
      * @param {boolean} [daemon] - Whether to run as daemon
      * @param {boolean} [uniqueNameLock] - Whether to lock the process name as unique
+     * @param {number} [instances] - Number of cluster instances (0 = max)
      * @returns {string} Path to the created monitor script
      */
-    static _createMonitorScript(processId, filePath, processName, logPath, autoRestart, restartTries, workingDir, daemon = false, uniqueNameLock = false) {
+    static _createMonitorScript(processId, filePath, processName, logPath, autoRestart, restartTries, workingDir, daemon = false, uniqueNameLock = false, instances = 1) {
         const systemInfo = this._detectSystem();
         const shell = systemInfo.shell;
         
@@ -300,12 +375,14 @@ REGISTRY_PATH='${escapedRegistryPath}'
 WORKING_DIR='${escapedWorkingDir}'
 CURRENT_TRIES=0
 MAX_RETRIES=${restartTries > 0 ? restartTries : 999999}
+INSTANCES=${instances || 1}
 
 echo "=== PROCESS MONITOR STARTED ===" >> "$LOG_PATH"
 echo "Process: $PROCESS_NAME (ID: $PROCESS_ID)" >> "$LOG_PATH"
 echo "Auto-restart: $AUTO_RESTART" >> "$LOG_PATH"
 echo "Max restarts: $MAX_RETRIES" >> "$LOG_PATH"
 echo "Working Directory: $WORKING_DIR" >> "$LOG_PATH"
+echo "Instances: $INSTANCES" >> "$LOG_PATH"
 echo "Started at: \$(date)" >> "$LOG_PATH"
 echo "Registry: $REGISTRY_PATH" >> "$LOG_PATH"
 echo "=================================" >> "$LOG_PATH"
@@ -702,31 +779,27 @@ stop() {
      * @param {string} [config.workingDir] - Working directory to run the process in
      * @param {boolean} [config.daemon] - Whether to run as system daemon (auto-start on boot)
      * @param {boolean} [config.uniqueNameLock] - Whether to lock the process name as unique
+     * @param {number} [config.instances] - Number of cluster instances to run (0 = max CPUs, 1 = single process)
      * @returns {Object} Process entry object with process details
      * @throws {Error} If file not found or working directory is invalid
      * 
      * @example
-     * // Run a file with auto-restart and daemon mode
+     * // Run a file with cluster mode (max CPUs)
      * SyPM.run('/path/to/app.js', { 
      *   name: 'my-app',
-     *   autoRestart: true,
-     *   restartTries: 3,
-     *   daemon: true
+     *   instances: 0
      * });
      * 
      * @example
-     * // Run code string with working directory
-     * SyPM.run('console.log("Hello World")', {
-     *   name: 'hello-script',
-     *   workingDir: '/tmp'
+     * // Run with 4 instances
+     * SyPM.run('/path/to/app.js', { 
+     *   name: 'my-app',
+     *   instances: 4
      * });
      * 
      * @example
-     * // Run with unique name lock
-     * SyPM.run('/path/to/app.js', {
-     *   name: 'my-unique-app',
-     *   uniqueNameLock: true
-     * });
+     * // Run a single instance (default)
+     * SyPM.run('/path/to/app.js', { name: 'my-app' });
      */
     static run(filepathOrCode, config = {}) {
         let resolvedPath;
@@ -806,6 +879,25 @@ stop() {
             }
         }
         
+        // Handle cluster mode (instances)
+        const instances = config.instances !== undefined ? config.instances : 1;
+        let actualScriptPath = resolvedPath;
+
+        if (instances > 1 || instances === 0) {
+            // Create cluster wrapper for multi-instance mode
+            const numInstances = instances === 0 ? os.cpus().length : instances;
+            console.log(`✓ Cluster mode enabled: ${numInstances} instances`);
+            
+            // Create cluster wrapper
+            const wrapperPath = this._createClusterWrapper(
+                this._generateId(),
+                resolvedPath,
+                instances,
+                path.join(LOG_DIR, `${config.name || 'process'}.log`)
+            );
+            actualScriptPath = wrapperPath;
+        }
+        
         const id = this._generateId();
         const processName = config.name || this._generateProcessName();
         const logPath = path.join(LOG_DIR, `${processName}.log`);
@@ -825,14 +917,15 @@ stop() {
             // For auto-restart processes, create and start monitor script
             const monitorScript = this._createMonitorScript(
                 id,
-                resolvedPath,
+                actualScriptPath,
                 processName,
                 logPath,
                 config.autoRestart ? 'true' : 'false',
                 config.restartTries || 0,
                 workingDir,
                 config.daemon,
-                config.uniqueNameLock
+                config.uniqueNameLock,
+                instances
             );
            
             const systemInfo = this._detectSystem();
@@ -860,7 +953,7 @@ stop() {
                 spawnOptions.cwd = workingDir;
             }
            
-            child = spawn(process.execPath, [resolvedPath], spawnOptions);
+            child = spawn(process.execPath, [actualScriptPath], spawnOptions);
     
             actualPid = child.pid;
             child.unref();
@@ -880,9 +973,11 @@ stop() {
                 currentTries: 0,
                 workingDir: workingDir,
                 daemon: !!config.daemon,
-                uniqueNameLock: !!config.uniqueNameLock
+                uniqueNameLock: !!config.uniqueNameLock,
+                instances: instances
             },
             isAutoRestart: !!(config.autoRestart || config.restartTries),
+            isCluster: instances > 1 || instances === 0,
             monitorPid: (config.autoRestart || config.restartTries) ? actualPid : null,
             lastUpdate: new Date().toISOString(),
             isTempFile: isTempFile,
@@ -907,6 +1002,12 @@ stop() {
         if (config.uniqueNameLock) {
             console.log(`✓ Unique name lock enabled for process: ${processName}`);
             console.log(`✓ No other process can use this name while this process exists`);
+        }
+
+        // Notify about cluster mode
+        if (instances > 1 || instances === 0) {
+            const numInstances = instances === 0 ? os.cpus().length : instances;
+            console.log(`✓ Running in cluster mode with ${numInstances} worker(s)`);
         }
     
         return entry;
@@ -943,6 +1044,7 @@ stop() {
                     autoRestart: proc.isAutoRestart ? 'Yes' : 'No',
                     daemon: proc.config?.daemon ? 'Yes' : 'No',
                     uniqueNameLock: proc.config?.uniqueNameLock ? 'Yes' : 'No',
+                    cluster: proc.isCluster ? `Yes (${proc.config?.instances === 0 ? 'max' : proc.config?.instances})` : 'No',
                     workingDir: proc.config?.workingDir || 'Default',
                     path: proc.path
                 });
@@ -992,6 +1094,7 @@ stop() {
                 autoRestart: proc.isAutoRestart ? 'Yes' : 'No',
                 daemon: proc.config?.daemon ? 'Yes' : 'No',
                 uniqueNameLock: proc.config?.uniqueNameLock ? 'Yes' : 'No',
+                cluster: proc.isCluster ? `Yes (${proc.config?.instances === 0 ? 'max' : proc.config?.instances})` : 'No',
                 workingDir: proc.config?.workingDir || 'Default',
                 path: proc.path
             });
@@ -1020,50 +1123,50 @@ stop() {
     }
 
     /**
- * Checks if a process is alive by its unique name
- * @static
- * @param {string} processName - Unique name of the process to check
- * @returns {boolean} True if process is running
- * 
- * @example
- * if (SyPM.isAliveByName('my-unique-app')) {
- *   console.log('Process is running');
- * }
- */
-static isAliveByName(processName) {
-    const registry = this._loadRegistry();
-    const proc = registry.find(p => p.name === processName && p.config.uniqueNameLock === true);
-    
-    if (!proc) {
-        console.error(`Process with name "${processName}" not found or doesn't have unique name lock enabled.`);
-        return false;
+     * Checks if a process is alive by its unique name
+     * @static
+     * @param {string} processName - Unique name of the process to check
+     * @returns {boolean} True if process is running
+     * 
+     * @example
+     * if (SyPM.isAliveByName('my-unique-app')) {
+     *   console.log('Process is running');
+     * }
+     */
+    static isAliveByName(processName) {
+        const registry = this._loadRegistry();
+        const proc = registry.find(p => p.name === processName && p.config.uniqueNameLock === true);
+        
+        if (!proc) {
+            console.error(`Process with name "${processName}" not found or doesn't have unique name lock enabled.`);
+            return false;
+        }
+        
+        return this.isAlive(proc.id);
     }
-    
-    return this.isAlive(proc.id);
-}
 
-/**
- * Kills a process by its unique name
- * @static
- * @param {string} processName - Unique name of the process to kill
- * @returns {boolean} True if process was found and killed
- * 
- * @example
- * // Kill by unique name
- * SyPM.killByName('my-unique-app');
- */
-static killByName(processName) {
-    const registry = this._loadRegistry();
-    const proc = registry.find(p => p.name === processName && p.config.uniqueNameLock === true);
-    
-    if (!proc) {
-        console.error(`Process with name "${processName}" not found or doesn't have unique name lock enabled.`);
-        return false;
+    /**
+     * Kills a process by its unique name
+     * @static
+     * @param {string} processName - Unique name of the process to kill
+     * @returns {boolean} True if process was found and killed
+     * 
+     * @example
+     * // Kill by unique name
+     * SyPM.killByName('my-unique-app');
+     */
+    static killByName(processName) {
+        const registry = this._loadRegistry();
+        const proc = registry.find(p => p.name === processName && p.config.uniqueNameLock === true);
+        
+        if (!proc) {
+            console.error(`Process with name "${processName}" not found or doesn't have unique name lock enabled.`);
+            return false;
+        }
+        
+        console.log(`Killing process by name: ${proc.name} (ID: ${proc.id}, PID: ${proc.pid})`);
+        return this.kill(proc.id);
     }
-    
-    console.log(`Killing process by name: ${proc.name} (ID: ${proc.id}, PID: ${proc.pid})`);
-    return this.kill(proc.id);
-}
 
     /**
      * Kills a process by PID or ID
@@ -1088,7 +1191,7 @@ static killByName(processName) {
             return false;
         }
        
-        console.log(`Killing process: ${proc.name} (ID: ${proc.id})`);
+        console.log(`Killing process: ${proc.name} (ID: ${proc.id})${proc.isCluster ? ' [CLUSTER]' : ''}`);
        
         // Mark as stopped in registry first
         proc.status = 'stopped';
@@ -1108,6 +1211,17 @@ static killByName(processName) {
         } else {
             // For regular processes, kill the process tree
             killed = this._killProcessTree(proc.pid);
+        }
+       
+        // For cluster processes, ensure all workers are killed
+        if (proc.isCluster) {
+            try {
+                // Send SIGTERM to the master process to gracefully shutdown workers
+                process.kill(proc.pid, 'SIGTERM');
+                console.log(`✓ Sent SIGTERM to cluster master (PID: ${proc.pid})`);
+            } catch (error) {
+                // Process might already be dead
+            }
         }
        
         if (killed) {
@@ -1187,6 +1301,17 @@ static killByName(processName) {
                 }
             }
            
+            // For cluster processes, send SIGTERM to master
+            if (proc.isCluster) {
+                try {
+                    process.kill(proc.pid, 'SIGTERM');
+                    console.log(`✓ Sent SIGTERM to cluster master for: ${proc.name}`);
+                    killed = true;
+                } catch (error) {
+                    // Process might already be dead
+                }
+            }
+           
             // For non-daemon processes, use the normal killing method
             if (!killed) {
                 if (proc.isAutoRestart && proc.monitorPid) {
@@ -1228,47 +1353,47 @@ static killByName(processName) {
     }
    
     /**
- * Checks if a process is alive by PID, ID, or name
- * @static
- * @param {string|number} identifier - Process ID, PID, or unique name to check
- * @returns {boolean} True if process is running
- * 
- * @example
- * // Check by PID
- * SyPM.isAlive(12345);
- * 
- * @example
- * // Check by ID
- * SyPM.isAlive('abc123def');
- * 
- * @example
- * // Check by name
- * SyPM.isAlive('my-unique-app');
- */
-static isAlive(identifier) {
-    const registry = this._loadRegistry();
-    
-    // Try to find by ID or PID first
-    let proc = registry.find(p => p.pid == identifier || p.id === identifier);
-    
-    // If not found, try to find by name (only if it has unique name lock)
-    if (!proc && typeof identifier === 'string') {
-        proc = registry.find(p => p.name === identifier && p.config.uniqueNameLock === true);
-    }
-    
-    if (!proc) return false;
-    
-    try {
-        if (proc.isAutoRestart && proc.monitorPid) {
-            process.kill(proc.monitorPid, 0);
-        } else {
-            process.kill(proc.pid, 0);
+     * Checks if a process is alive by PID, ID, or name
+     * @static
+     * @param {string|number} identifier - Process ID, PID, or unique name to check
+     * @returns {boolean} True if process is running
+     * 
+     * @example
+     * // Check by PID
+     * SyPM.isAlive(12345);
+     * 
+     * @example
+     * // Check by ID
+     * SyPM.isAlive('abc123def');
+     * 
+     * @example
+     * // Check by name
+     * SyPM.isAlive('my-unique-app');
+     */
+    static isAlive(identifier) {
+        const registry = this._loadRegistry();
+        
+        // Try to find by ID or PID first
+        let proc = registry.find(p => p.pid == identifier || p.id === identifier);
+        
+        // If not found, try to find by name (only if it has unique name lock)
+        if (!proc && typeof identifier === 'string') {
+            proc = registry.find(p => p.name === identifier && p.config.uniqueNameLock === true);
         }
-        return true;
-    } catch (error) {
-        return false;
+        
+        if (!proc) return false;
+        
+        try {
+            if (proc.isAutoRestart && proc.monitorPid) {
+                process.kill(proc.monitorPid, 0);
+            } else {
+                process.kill(proc.pid, 0);
+            }
+            return true;
+        } catch (error) {
+            return false;
+        }
     }
-}
 
     /**
      * Follows logs of a process in real-time
@@ -1431,6 +1556,10 @@ static isAlive(identifier) {
         if (proc.config?.uniqueNameLock) {
             console.log(`🔒 Unique name lock: Enabled`);
         }
+        if (proc.isCluster) {
+            const numInstances = proc.config?.instances === 0 ? 'max' : proc.config?.instances;
+            console.log(`⚡ Cluster mode: Enabled (${numInstances} instances)`);
+        }
         console.log('=' .repeat(80));
         console.log('Press Ctrl+C to stop following logs\n');
 
@@ -1509,7 +1638,7 @@ static isAlive(identifier) {
             return false;
         }
    
-        console.log(`Restarting process: ${proc.name} (ID: ${proc.id})`);
+        console.log(`Restarting process: ${proc.name} (ID: ${proc.id})${proc.isCluster ? ' [CLUSTER]' : ''}`);
        
         // Kill the current process
         this.kill(proc.id);
@@ -1527,7 +1656,8 @@ static isAlive(identifier) {
                 restartTries: proc.config.restartTries,
                 workingDir: proc.config.workingDir,
                 daemon: proc.config.daemon,
-                uniqueNameLock: proc.config.uniqueNameLock
+                uniqueNameLock: proc.config.uniqueNameLock,
+                instances: proc.config.instances || 1
             });
            
             console.log(`✓ Successfully restarted: ${newProcess.name} (New PID: ${newProcess.pid}, ID: ${newProcess.id})`);
@@ -1539,6 +1669,10 @@ static isAlive(identifier) {
             }
             if (newProcess.config.uniqueNameLock) {
                 console.log(`✓ Unique name lock: Enabled`);
+            }
+            if (newProcess.isCluster) {
+                const numInstances = newProcess.config.instances === 0 ? 'max' : newProcess.config.instances;
+                console.log(`✓ Cluster mode: ${numInstances} instances`);
             }
         }, 1000);
        
@@ -1691,16 +1825,19 @@ static isAlive(identifier) {
         console.log(`Registry File: ${PROCESS_REGISTRY}`);
         console.log(`Log Directory: ${LOG_DIR}`);
         console.log(`Daemon Directory: ${DAEMON_DIR}`);
+        console.log(`Cluster Wrapper Directory: ${CLUSTER_LOG_DIR}`);
         console.log(`Operating System: ${systemInfo.platform}`);
         console.log(`Init System: ${systemInfo.initSystem}`);
         console.log(`Default Shell: ${systemInfo.shell}`);
         console.log(`Alpine Linux: ${systemInfo.isAlpine ? 'Yes' : 'No'}`);
+        console.log(`CPU Cores: ${os.cpus().length}`);
         
         const registry = this._loadRegistry();
         console.log(`Total Processes: ${registry.length}`);
         console.log(`Active Processes: ${registry.filter(p => this.isAlive(p.id)).length}`);
         console.log(`Daemon Processes: ${registry.filter(p => p.config?.daemon).length}`);
         console.log(`Unique Name Locked Processes: ${registry.filter(p => p.config?.uniqueNameLock).length}`);
+        console.log(`Cluster Mode Processes: ${registry.filter(p => p.isCluster).length}`);
     }
 
     /**
@@ -1808,10 +1945,26 @@ setInterval(() => {
 }, 10000);
 `;
 
+            // HTTP server script for cluster testing
+            const httpScript = `
+const http = require('http');
+const server = http.createServer((req, res) => {
+    res.writeHead(200);
+    res.end('Hello from PID: ' + process.pid);
+});
+server.listen(0, () => {
+    console.log('Server started on port:', server.address().port);
+    console.log('Process PID:', process.pid);
+});
+// Keep alive
+setInterval(() => {}, 1000);
+`;
+
             const scripts = {
                 simple: { code: simpleScript, file: path.join(tmpdir(), 'test_simple.js') },
                 crash: { code: crashScript, file: path.join(tmpdir(), 'test_crash.js') },
-                long: { code: longRunningScript, file: path.join(tmpdir(), 'test_long.js') }
+                long: { code: longRunningScript, file: path.join(tmpdir(), 'test_long.js') },
+                http: { code: httpScript, file: path.join(tmpdir(), 'test_http.js') }
             };
 
             // Write test scripts to files
@@ -2068,7 +2221,50 @@ setInterval(() => {
             await waitFor(() => this.isAlive(process.id), 3000, 100);
         });
 
-        // Test 14: Daemon mode functionality (test without actual system installation)
+        // Test 14: Cluster mode - max instances
+        await runTest('Cluster mode with max instances (0)', async () => {
+            const process = this.run(testScripts.http.file, {
+                name: 'test-cluster-max',
+                instances: 0
+            });
+            
+            if (!process.isCluster) {
+                throw new Error('Process should be in cluster mode');
+            }
+            
+            const expectedInstances = os.cpus().length;
+            console.log(`\n     Expected instances: ${expectedInstances}`);
+            
+            // Wait for cluster to start
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Clean up
+            this.kill(process.id);
+        });
+
+        // Test 15: Cluster mode - specific instances
+        await runTest('Cluster mode with specific instances (2)', async () => {
+            const process = this.run(testScripts.http.file, {
+                name: 'test-cluster-2',
+                instances: 2
+            });
+            
+            if (!process.isCluster) {
+                throw new Error('Process should be in cluster mode');
+            }
+            
+            if (process.config.instances !== 2) {
+                throw new Error(`Expected 2 instances, got ${process.config.instances}`);
+            }
+            
+            // Wait for cluster to start
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Clean up
+            this.kill(process.id);
+        });
+
+        // Test 16: Daemon mode functionality (test without actual system installation)
         await runTest('Daemon mode configuration', async () => {
             const systemInfo = this._detectSystem();
             if (!systemInfo.isLinux) {
@@ -2091,7 +2287,7 @@ setInterval(() => {
             this.kill(process.id);
         });
 
-        // Test 15: Cleanup functionality
+        // Test 17: Cleanup functionality
         await runTest('Cleanup dead processes', async () => {
             // Kill the auto-restart process first
             this.kill(autoRestartProcessId);
@@ -2107,7 +2303,7 @@ setInterval(() => {
             }
         });
 
-        // Test 16: Kill all processes
+        // Test 18: Kill all processes
         await runTest('Kill all processes', async () => {
             // Start a few processes first
             this.run(testScripts.simple.file, { name: 'test-kill-all-1' });
@@ -2128,13 +2324,13 @@ setInterval(() => {
             }
         });
 
-        // Test 17: Info functionality
+        // Test 19: Info functionality
         await runTest('System info display', () => {
             // This should not throw an error
             this.info();
         });
 
-        // Test 18: Process restart functionality
+        // Test 20: Process restart functionality
         await runTest('Process restart functionality', async () => {
             const process = this.run(testScripts.long.file, {
                 name: 'test-restart'
@@ -2172,7 +2368,7 @@ setInterval(() => {
             await waitFor(() => !this.isAlive(restartedProcess.id), 3000, 100);
         });
 
-        // Test 19: All processes log following
+        // Test 21: All processes log following
         await runTest('All processes log following', async () => {
             // Start multiple processes
             const process1 = this.run(testScripts.simple.code, { name: 'test-log-all-1' });
@@ -2182,8 +2378,6 @@ setInterval(() => {
             await new Promise(resolve => setTimeout(resolve, 1000));
             
             // Test that log method doesn't throw when called without arguments
-            // We can't actually test the real-time following in automated tests
-            // but we can verify the method exists and accepts the parameter
             if (typeof this.log !== 'function') {
                 throw new Error('Log method is not a function');
             }
@@ -2248,6 +2442,7 @@ setInterval(() => {
       --working-dir <path>  Run the process in specified working directory
       --daemon              Run as system daemon (auto-start on system boot)
       --unique-name-lock    Lock the process name as unique (prevent duplicates)
+      --instances <n>       Number of cluster instances (0 = max CPUs, 1 = single)
     
     Global Features:
       • Processes are managed system-wide from: ${GLOBAL_BASE_DIR}
@@ -2261,6 +2456,12 @@ setInterval(() => {
       • Unique name locking to prevent duplicate process names
       • Kill and check alive status by unique name
       • Follow logs for all processes simultaneously
+      • Cluster mode for multi-core scaling (like PM2 -i max)
+    
+    Cluster Mode Examples:
+      node SyPM --run app.js --instances 0        # Use all CPU cores (like PM2 -i max)
+      node SyPM --run app.js --instances 4        # Use exactly 4 instances
+      node SyPM --run app.js --name my-app --instances 0  # Named cluster with max CPUs
     
     Examples:
       node SyPM --run app.js --name my-app --unique-name-lock
@@ -2368,6 +2569,17 @@ setInterval(() => {
                 config.uniqueNameLock = true;
             }
             
+            // Handle instances flag
+            if (args.includes('--instances')) {
+                const instancesIndex = args.indexOf('--instances');
+                if (instancesIndex + 1 < args.length && !args[instancesIndex + 1].startsWith('--')) {
+                    const instances = parseInt(args[instancesIndex + 1]);
+                    if (!isNaN(instances) && instances >= 0) {
+                        config.instances = instances;
+                    }
+                }
+            }
+            
             try {
                 const result = this.run(filePath, config);
                 console.log(`✓ Started process: ${result.name} (PID: ${result.pid}, ID: ${result.id})`);
@@ -2384,6 +2596,10 @@ setInterval(() => {
                 if (config.uniqueNameLock) {
                     console.log(`✓ Unique name lock: Enabled (no duplicate names allowed)`);
                     console.log(`✓ You can now use "${result.name}" with --alive and --kill commands`);
+                }
+                if (config.instances && config.instances !== 1) {
+                    const numInstances = config.instances === 0 ? os.cpus().length : config.instances;
+                    console.log(`✓ Cluster mode: ${numInstances} instances`);
                 }
             } catch (error) {
                 console.error('✗ Error starting process:', error.message);
