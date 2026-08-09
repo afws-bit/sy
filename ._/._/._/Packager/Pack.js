@@ -96,6 +96,7 @@ const ARCHIVE_EXTENSIONS = new Set([
 ]);
 
 // Binary file extensions
+// FIXED: Removed '.ts' which is a TypeScript/Video conflict
 const BINARY_EXTENSIONS = new Set([
   '.exe', '.dll', '.so', '.dylib', '.bin', '.out', '.elf', '.app',
   '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg', '.webp', '.tiff', '.psd',
@@ -103,7 +104,7 @@ const BINARY_EXTENSIONS = new Set([
   '.ttf', '.otf', '.woff', '.woff2', '.eot', '.pfb', '.pfm', '.afm',
   '.mp3', '.mp4', '.wav', '.avi', '.mov', '.mkv', '.flac', '.ogg', '.webm',
   '.m4a', '.m4v', '.wma', '.wmv', '.aac', '.ac3', '.ape', '.mid', '.midi',
-  '.mpg', '.mpeg', '.m2v', '.mts', '.m2ts', '.ts', '.flv', '.swf', '.vob',
+  '.mpg', '.mpeg', '.m2v', '.mts', '.m2ts', '.flv', '.swf', '.vob',
   '.3gp', '.3g2', '.asf', '.rm', '.ra', '.ram', '.divx', '.xvid',
   '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.odt', '.ods',
   '.odp', '.odg', '.odf', '.pub', '.rtf', '.wpd', '.wps', '.key', '.numbers',
@@ -114,8 +115,109 @@ const BINARY_EXTENSIONS = new Set([
   '.class', '.dex', '.odex'
 ]);
 
-// Assembly extensions set for quick lookup
-const ASSEMBLY_EXTENSIONS = new Set(['.asm', '.s', '.inc', '.nasm', '.masm', '.arm', '.lst']);
+// FIXED: Added priority check - code extensions that might overlap with binary/media extensions
+const CODE_EXTENSIONS_PRIORITY = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.py3', '.pyw',
+  '.java', '.cs', '.csx',
+  '.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.hh', '.hxx',
+  '.go', '.rb', '.php', '.swift', '.kt', '.kts', '.rs',
+  '.dart', '.scala', '.sc', '.groovy', '.lua', '.r',
+  '.pl', '.pm', '.ps1', '.psm1', '.psd1',
+  '.zig', '.asm', '.s', '.inc', '.nasm'
+]);
+
+// ===== EXTENSION HANDLING FUNCTIONS =====
+
+/**
+ * Gets the final extension from a filename.
+ * For 'file-12-one-example.ts' returns '.ts'
+ * For 'Dockerfile' returns 'Dockerfile'
+ */
+function getFinalExtension(filePath) {
+  const filename = path.basename(filePath);
+  
+  const specialFilenames = ['Dockerfile', 'Makefile', 'CMakeLists.txt'];
+  if (specialFilenames.includes(filename)) {
+    return filename;
+  }
+  
+  if (filename.startsWith('.')) {
+    const lastDotIndex = filename.lastIndexOf('.');
+    if (lastDotIndex > 0) {
+      return filename.substring(lastDotIndex).toLowerCase();
+    }
+    return filename.toLowerCase();
+  }
+  
+  const lastDotIndex = filename.lastIndexOf('.');
+  if (lastDotIndex === -1) {
+    return '';
+  }
+  
+  return filename.substring(lastDotIndex).toLowerCase();
+}
+
+/**
+ * Checks if a filename matches a specific extension.
+ */
+function filenameMatchesExtension(filename, extension) {
+  const name = path.basename(filename);
+  const nameLowerCase = name.toLowerCase();
+  const extensionLowerCase = extension.toLowerCase();
+  
+  if (nameLowerCase === extensionLowerCase) {
+    return true;
+  }
+  
+  if (extensionLowerCase.startsWith('.')) {
+    return nameLowerCase.endsWith(extensionLowerCase);
+  }
+  
+  return nameLowerCase === extensionLowerCase;
+}
+
+/**
+ * Checks if a filename matches any extension in a collection.
+ */
+function filenameMatchesAnyExtension(filename, extensions) {
+  const extensionList = extensions instanceof Set ? [...extensions] : extensions;
+  
+  for (const extension of extensionList) {
+    if (filenameMatchesExtension(filename, extension)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * Detects the programming language of a file.
+ */
+function detectFileLanguage(filename) {
+  for (const [language, extensions] of Object.entries(LANGUAGE_EXTENSIONS)) {
+    if (filenameMatchesAnyExtension(filename, extensions)) {
+      return language;
+    }
+  }
+  return null;
+}
+
+/**
+ * Check if a file is an archive.
+ */
+function isArchiveFile(filename) {
+  return filenameMatchesAnyExtension(filename, ARCHIVE_EXTENSIONS);
+}
+
+/**
+ * FIXED: Check if file extension is a known code extension (takes priority over binary).
+ */
+function isCodeExtension(filename) {
+  const extension = getFinalExtension(filename);
+  return CODE_EXTENSIONS_PRIORITY.has(extension);
+}
 
 // Helper to format bytes to human readable
 function formatSize(bytes) {
@@ -150,35 +252,6 @@ function centerText(text, width = terminalWidth) {
 // ===== GENERIC BINARY DETECTION =====
 
 /**
- * Check if a file is an archive based on extension
- */
-function isArchiveFile(filename) {
-  const ext = path.extname(filename).toLowerCase();
-  return ARCHIVE_EXTENSIONS.has(ext);
-}
-
-/**
- * GENERIC: Check if a file is a binary executable
- */
-async function isExecutableBinary(filePath, stats) {
-  try {
-    if (stats.isFile()) {
-      await access(filePath, fs.constants.X_OK);
-      const ext = path.extname(filePath).toLowerCase();
-      if (ext === '') {
-        return true;
-      }
-      if (BINARY_EXTENSIONS.has(ext)) {
-        return true;
-      }
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * GENERIC: Quick check for binary content (looks for null bytes)
  */
 async function isBinaryContent(filePath, stats) {
@@ -206,16 +279,24 @@ async function isBinaryContent(filePath, stats) {
 
 /**
  * GENERIC: Main function to determine if a file is binary
+ * FIXED: Code extensions take priority over binary detection
  */
 async function isBinaryFile(filePath, stats) {
   const filename = path.basename(filePath);
-  const ext = path.extname(filename).toLowerCase();
   
-  if (BINARY_EXTENSIONS.has(ext)) {
+  // FIXED: If this is a known code extension, it's NOT binary
+  // even if the extension appears in BINARY_EXTENSIONS
+  if (isCodeExtension(filename)) {
+    return false;
+  }
+  
+  // Check using centralized extension matching
+  if (filenameMatchesAnyExtension(filename, BINARY_EXTENSIONS)) {
     return true;
   }
   
-  if (ext === '') {
+  const extension = getFinalExtension(filePath);
+  if (extension === '') {
     try {
       await access(filePath, fs.constants.X_OK);
       return true;
@@ -340,12 +421,12 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
     this.name = 'Total Size Analyzer';
     this.ignoreDirs = ignoreDirs;
     this.totalSize = 0;
-    this.realTotalSize = 0; // NEW: Real total size including .git and ignored dirs
+    this.realTotalSize = 0;
     this.codeSize = 0;
     this.binarySize = 0;
     this.archiveSize = 0;
-    this.gitSize = 0; // NEW: Track .git directory size separately
-    this.ignoredDirsSize = 0; // NEW: Track size of ignored directories
+    this.gitSize = 0;
+    this.ignoredDirsSize = 0;
     this.fileCount = 0;
     this.dirCount = 0;
     this.skippedDirs = [];
@@ -393,18 +474,10 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
         this.binarySize += stats.size;
       }
       else {
-        const ext = path.extname(filename).toLowerCase();
-        let isCodeFile = false;
-        for (const extensions of Object.values(LANGUAGE_EXTENSIONS)) {
-          if (extensions.includes(ext) || extensions.includes(filename)) {
-            this.codeSize += stats.size;
-            isCodeFile = true;
-            break;
-          }
-        }
-        // If not code, binary, or archive, it falls into "other"
-        if (!isCodeFile) {
-          // Already counted in totalSize, will be calculated as "other" in getReport
+        // Check if it's a code file using the centralized language detection
+        const language = detectFileLanguage(filename);
+        if (language) {
+          this.codeSize += stats.size;
         }
       }
       
@@ -557,6 +630,7 @@ class PackageJsonAnalyzer extends BaseAnalyzer {
 
 /**
  * Analyzer for counting lines of code by language
+ * FIXED: Now correctly handles multi-dot extensions like file-12-one-example.ts
  */
 class LocAnalyzer extends BaseAnalyzer {
   constructor() {
@@ -569,7 +643,6 @@ class LocAnalyzer extends BaseAnalyzer {
 
   async processFile(filePath, stats) {
     const filename = path.basename(filePath);
-    const ext = path.extname(filename).toLowerCase();
     const relativePath = path.relative(process.cwd(), filePath);
     const pathParts = relativePath.split(path.sep);
     
@@ -582,51 +655,19 @@ class LocAnalyzer extends BaseAnalyzer {
     if (isArchiveFile(filename)) return;
     if (await isBinaryFile(filePath, stats)) return;
     
+    // Detect language using the centralized function
+    const language = detectFileLanguage(filename);
     
-    if (ASSEMBLY_EXTENSIONS.has(ext)) {
+    if (language) {
       try {
         const content = await readFile(filePath, 'utf8');
         const lines = content.split('\n').length;
-        this.linesByLanguage['assembly'] = (this.linesByLanguage['assembly'] || 0) + lines;
-        this.filesByLanguage['assembly'] = (this.filesByLanguage['assembly'] || 0) + 1;
+        
+        this.linesByLanguage[language] = (this.linesByLanguage[language] || 0) + lines;
+        this.filesByLanguage[language] = (this.filesByLanguage[language] || 0) + 1;
         this.totalLines += lines;
-        return;
-      } catch (error) {}
-    }
-    
-    if (filename === 'Dockerfile') {
-      try {
-        const content = await readFile(filePath, 'utf8');
-        const lines = content.split('\n').length;
-        this.linesByLanguage['docker'] = (this.linesByLanguage['docker'] || 0) + lines;
-        this.filesByLanguage['docker'] = (this.filesByLanguage['docker'] || 0) + 1;
-        this.totalLines += lines;
-        return;
-      } catch (error) {}
-    }
-    
-    if (filename === 'Makefile' || filename.endsWith('.mk')) {
-      try {
-        const content = await readFile(filePath, 'utf8');
-        const lines = content.split('\n').length;
-        this.linesByLanguage['make'] = (this.linesByLanguage['make'] || 0) + lines;
-        this.filesByLanguage['make'] = (this.filesByLanguage['make'] || 0) + 1;
-        this.totalLines += lines;
-        return;
-      } catch (error) {}
-    }
-    
-    for (const [language, extensions] of Object.entries(LANGUAGE_EXTENSIONS)) {
-      if (extensions.includes(ext) || extensions.includes(filename)) {
-        try {
-          const content = await readFile(filePath, 'utf8');
-          const lines = content.split('\n').length;
-          
-          this.linesByLanguage[language] = (this.linesByLanguage[language] || 0) + lines;
-          this.filesByLanguage[language] = (this.filesByLanguage[language] || 0) + 1;
-          this.totalLines += lines;
-        } catch (error) {}
-        break;
+      } catch (error) {
+        // Skip files that can't be read
       }
     }
   }
@@ -680,18 +721,18 @@ class ArchiveAnalyzer extends BaseAnalyzer {
     }
     
     if (isArchiveFile(filename)) {
-      const ext = path.extname(filename).toLowerCase();
+      const extension = getFinalExtension(filename);
       this.archives.push({
         path: filePath,
         name: filename,
         size: stats.size,
         sizeFormatted: formatSize(stats.size),
         sizeMB: formatMB(stats.size),
-        type: ext
+        type: extension
       });
       this.totalSize += stats.size;
       this.totalCount++;
-      this.byType[ext] = (this.byType[ext] || 0) + 1;
+      this.byType[extension] = (this.byType[extension] || 0) + 1;
     }
   }
 
@@ -749,7 +790,7 @@ class BinaryAnalyzer extends BaseAnalyzer {
     }
     
     if (await isBinaryFile(filePath, stats)) {
-      const ext = path.extname(filename).toLowerCase() || '[no ext]';
+      const extension = getFinalExtension(filename) || '[no ext]';
       
       this.binaries.push({
         path: filePath,
@@ -757,11 +798,11 @@ class BinaryAnalyzer extends BaseAnalyzer {
         size: stats.size,
         sizeFormatted: formatSize(stats.size),
         sizeMB: formatMB(stats.size),
-        type: ext
+        type: extension
       });
       this.totalSize += stats.size;
       this.totalCount++;
-      this.byType[ext] = (this.byType[ext] || 0) + 1;
+      this.byType[extension] = (this.byType[extension] || 0) + 1;
     }
   }
 
