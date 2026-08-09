@@ -769,6 +769,353 @@ stop() {
     }
 
     /**
+     * Executes a global command line as a managed process
+     * @static
+     * @param {string} command - The command to execute (e.g., 'ls -la', 'python script.py')
+     * @param {Object} [config={}] - Configuration options for the process
+     * @param {string} [config.name] - Custom name for the process
+     * @param {boolean} [config.autoRestart] - Whether to auto-restart the process on crash
+     * @param {number} [config.restartTries] - Number of restart attempts (implies autoRestart)
+     * @param {string} [config.workingDir] - Working directory to run the process in
+     * @param {boolean} [config.daemon] - Whether to run as system daemon (auto-start on boot)
+     * @param {boolean} [config.uniqueNameLock] - Whether to lock the process name as unique
+     * @returns {Object} Process entry object with process details
+     * @throws {Error} If command is empty or invalid
+     * 
+     * @example
+     * // Run a simple command
+     * SyPM.exec('ls -la', { name: 'list-files' });
+     * 
+     * @example
+     * // Run a Python script with auto-restart
+     * SyPM.exec('python3 server.py', { 
+     *   name: 'python-server',
+     *   autoRestart: true,
+     *   workingDir: '/path/to/project'
+     * });
+     * 
+     * @example
+     * // Run a shell command with unique name lock
+     * SyPM.exec('npm run dev', {
+     *   name: 'dev-server',
+     *   uniqueNameLock: true
+     * });
+     */
+    static exec(command, config = {}) {
+        if (!command || typeof command !== 'string' || command.trim().length === 0) {
+            throw new Error('Command cannot be empty');
+        }
+
+        const systemInfo = this._detectSystem();
+        const id = this._generateId();
+        const processName = config.name || `cmd_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+        const logPath = path.join(LOG_DIR, `${processName}.log`);
+        
+        // Check if name is already locked and in use
+        if (config.uniqueNameLock && this._isNameLocked(processName, config.uniqueNameLock)) {
+            throw new Error(`Process name "${processName}" is already in use and locked as unique. Cannot start another process with the same name.`);
+        }
+        
+        // Create initial log entry
+        fs.writeFileSync(logPath, `Global Command Execution - Started: ${new Date().toISOString()}\nCommand: ${command}\n`, 'utf-8');
+        
+        // Parse command into executable and arguments
+        const commandParts = command.trim().split(/\s+/);
+        const executable = commandParts[0];
+        const args = commandParts.slice(1);
+        
+        let child;
+        let actualPid;
+        let workingDir = config.workingDir || null;
+        
+        // Validate working directory if provided
+        if (workingDir) {
+            workingDir = path.resolve(workingDir);
+            if (!fs.existsSync(workingDir)) {
+                throw new Error(`Working directory does not exist: ${workingDir}`);
+            }
+            if (!fs.statSync(workingDir).isDirectory()) {
+                throw new Error(`Working directory is not a directory: ${workingDir}`);
+            }
+        }
+        
+        // Create a wrapper script for auto-restart if needed
+        if (config.autoRestart || config.restartTries) {
+            const wrapperScript = this._createCommandMonitorScript(
+                id,
+                command,
+                processName,
+                logPath,
+                config.autoRestart ? 'true' : 'false',
+                config.restartTries || 0,
+                workingDir
+            );
+            
+            // Start the monitor script
+            child = spawn(systemInfo.shell, [wrapperScript], {
+                detached: true,
+                stdio: 'ignore'
+            });
+            
+            actualPid = child.pid;
+            child.unref();
+            
+            console.log(`✓ Started monitor for command with PID: ${actualPid} using ${systemInfo.shell}`);
+        } else {
+            // For regular commands, start directly
+            const logFileDescriptor = fs.openSync(logPath, 'a');
+            
+            const spawnOptions = {
+                detached: true,
+                stdio: ['ignore', logFileDescriptor, logFileDescriptor],
+                shell: systemInfo.shell
+            };
+            
+            // Add working directory if specified
+            if (workingDir) {
+                spawnOptions.cwd = workingDir;
+            }
+            
+            child = spawn(executable, args, spawnOptions);
+            
+            actualPid = child.pid;
+            child.unref();
+        }
+        
+        const entry = {
+            id,
+            pid: actualPid,
+            name: processName,
+            path: command, // Store the command as the path
+            log: logPath,
+            createdAt: new Date().toISOString(),
+            status: 'running',
+            type: 'global_command', // Mark as global command type
+            config: {
+                autoRestart: !!config.autoRestart,
+                restartTries: config.restartTries || 0,
+                currentTries: 0,
+                workingDir: workingDir,
+                daemon: !!config.daemon,
+                uniqueNameLock: !!config.uniqueNameLock,
+                command: command, // Store the original command
+                shell: systemInfo.shell
+            },
+            isAutoRestart: !!(config.autoRestart || config.restartTries),
+            isGlobalCommand: true, // Flag to identify global commands
+            monitorPid: (config.autoRestart || config.restartTries) ? actualPid : null,
+            lastUpdate: new Date().toISOString()
+        };
+        
+        const registry = this._loadRegistry();
+        registry.push(entry);
+        this._saveRegistry(registry);
+        
+        // Enable daemon mode if requested
+        if (config.daemon) {
+            const daemonSuccess = this._enableDaemon(id, entry);
+            if (daemonSuccess) {
+                console.log(`✓ Daemon mode enabled for command: ${processName}`);
+                console.log(`✓ Process will auto-start on system reboot`);
+            }
+        }
+        
+        // Notify about unique name lock if enabled
+        if (config.uniqueNameLock) {
+            console.log(`✓ Unique name lock enabled for command: ${processName}`);
+            console.log(`✓ No other process can use this name while this process exists`);
+        }
+        
+        return entry;
+    }
+    
+    /**
+     * Creates a monitor script for auto-restart global commands
+     * @static
+     * @private
+     * @param {string} processId - Unique process identifier
+     * @param {string} command - The command to execute
+     * @param {string} processName - Name of the process
+     * @param {string} logPath - Path to the log file
+     * @param {boolean} autoRestart - Whether to auto-restart the process
+     * @param {number} restartTries - Number of restart attempts
+     * @param {string} [workingDir] - Optional working directory
+     * @returns {string} Path to the created monitor script
+     */
+    static _createCommandMonitorScript(processId, command, processName, logPath, autoRestart, restartTries, workingDir) {
+        const systemInfo = this._detectSystem();
+        const shell = systemInfo.shell;
+        
+        // Escape paths for use in shell script
+        const escapedRegistryPath = PROCESS_REGISTRY.replace(/'/g, "'\\''");
+        const escapedLogPath = logPath.replace(/'/g, "'\\''");
+        const escapedWorkingDir = workingDir ? workingDir.replace(/'/g, "'\\''") : '';
+        
+        const scriptContent = `#!/usr/bin/env ${shell}
+
+PROCESS_ID='${processId}'
+COMMAND='${command.replace(/'/g, "'\\''")}'
+PROCESS_NAME='${processName}'
+LOG_PATH='${escapedLogPath}'
+AUTO_RESTART=${autoRestart ? 'true' : 'false'}
+RESTART_TRIES=${restartTries || 0}
+REGISTRY_PATH='${escapedRegistryPath}'
+WORKING_DIR='${escapedWorkingDir}'
+CURRENT_TRIES=0
+MAX_RETRIES=${restartTries > 0 ? restartTries : 999999}
+
+echo "=== GLOBAL COMMAND MONITOR STARTED ===" >> "$LOG_PATH"
+echo "Process: $PROCESS_NAME (ID: $PROCESS_ID)" >> "$LOG_PATH"
+echo "Command: $COMMAND" >> "$LOG_PATH"
+echo "Auto-restart: $AUTO_RESTART" >> "$LOG_PATH"
+echo "Max restarts: $MAX_RETRIES" >> "$LOG_PATH"
+echo "Working Directory: $WORKING_DIR" >> "$LOG_PATH"
+echo "Started at: \$(date)" >> "$LOG_PATH"
+echo "=================================" >> "$LOG_PATH"
+
+# Function to update registry
+update_registry() {
+    local status="\$1"
+    local node_pid="\$2"
+    local current_tries="\$3"
+    
+    # Create a temporary Node.js script to update the registry
+    cat > /tmp/update_registry_$$.js << EOF
+const fs = require('fs');
+try {
+    const registryPath = '${escapedRegistryPath}';
+    if (fs.existsSync(registryPath)) {
+        const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+        const processIndex = registry.findIndex(p => p.id === '${processId}');
+        if (processIndex !== -1) {
+            registry[processIndex].status = '\$status';
+            if ('\$node_pid' && '\$node_pid' !== 'null') {
+                registry[processIndex].pid = parseInt('\$node_pid');
+            }
+            registry[processIndex].monitorPid = $$;
+            registry[processIndex].config.currentTries = parseInt('\$current_tries');
+            registry[processIndex].lastUpdate = new Date().toISOString();
+            fs.writeFileSync(registryPath, JSON.stringify(registry, null, 2));
+            console.log('Registry updated:', '\$status');
+        }
+    }
+} catch (error) {
+    console.error('Registry update failed:', error.message);
+}
+EOF
+    
+    node /tmp/update_registry_$$.js >> "$LOG_PATH" 2>&1
+    rm -f /tmp/update_registry_$$.js
+}
+
+# Function to check if we should continue
+should_continue() {
+    cat > /tmp/check_registry_$$.js << EOF
+const fs = require('fs');
+try {
+    const registryPath = '${escapedRegistryPath}';
+    if (fs.existsSync(registryPath)) {
+        const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+        const process = registry.find(p => p.id === '${processId}');
+        if (!process) {
+            console.log('Process not found in registry');
+            process.exit(1);
+        }
+        if (process.status === 'stopped' || process.status === 'dead') {
+            console.log('Process status is stopped/dead:', process.status);
+            process.exit(1);
+        }
+        console.log('Process status OK:', process.status);
+        process.exit(0);
+    } else {
+        console.log('Registry file not found');
+        process.exit(1);
+    }
+} catch (e) {
+    console.log('Registry check error:', e.message);
+    process.exit(0);
+}
+EOF
+    
+    node /tmp/check_registry_$$.js >> "$LOG_PATH" 2>&1
+    local result=\$?
+    rm -f /tmp/check_registry_$$.js
+    return \$result
+}
+
+# Function to start and monitor the command
+start_and_monitor() {
+    local attempt=\$1
+    echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Starting command - Attempt: \$((attempt + 1))/\$MAX_RETRIES" >> "\$LOG_PATH"
+    
+    # Set working directory if specified
+    if [ -n "\$WORKING_DIR" ] && [ -d "\$WORKING_DIR" ]; then
+        cd "\$WORKING_DIR"
+        echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Working directory: \$WORKING_DIR" >> "\$LOG_PATH"
+    fi
+    
+    # Execute the command
+    echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Executing: \$COMMAND" >> "\$LOG_PATH"
+    eval "\$COMMAND" >> "\$LOG_PATH" 2>&1 &
+    local CMD_PID=\$!
+    
+    echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Command started with PID: \$CMD_PID" >> "\$LOG_PATH"
+    
+    # Update registry with running status
+    update_registry "running" "\$CMD_PID" "\$attempt"
+    
+    # Wait for the command to exit
+    wait \$CMD_PID
+    local exit_code=\$?
+    
+    echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Command exited with code: \$exit_code" >> "\$LOG_PATH"
+    
+    return \$exit_code
+}
+
+# Main monitor function
+main() {
+    echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Monitor starting for command: \$PROCESS_NAME" >> "\$LOG_PATH"
+    
+    while true; do
+        # Check if we should continue monitoring
+        if ! should_continue; then
+            echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Monitor stopped by registry - command should not continue" >> "\$LOG_PATH"
+            update_registry "dead" "null" "\$CURRENT_TRIES"
+            break
+        fi
+        
+        # Start and monitor the command
+        start_and_monitor \$CURRENT_TRIES
+        local exit_code=\$?
+        
+        # Check if auto-restart is enabled and we have tries left
+        if [ "\$AUTO_RESTART" = "true" ] && [ \$CURRENT_TRIES -lt \$((MAX_RETRIES - 1)) ]; then
+            CURRENT_TRIES=\$((CURRENT_TRIES + 1))
+            echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Auto-restarting... Attempt: \$CURRENT_TRIES/\$MAX_RETRIES" >> "\$LOG_PATH"
+            update_registry "restarting" "null" "\$CURRENT_TRIES"
+            sleep 2
+        else
+            echo "[\$(date +'%Y-%m-%d %H:%M:%S')] No more restart attempts. Final status." >> "\$LOG_PATH"
+            update_registry "dead" "null" "\$CURRENT_TRIES"
+            break
+        fi
+    done
+    
+    echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Monitor stopped for command: \$PROCESS_NAME" >> "\$LOG_PATH"
+}
+
+# Start the main function
+main
+`;
+
+        const scriptPath = path.join(LOG_DIR, `monitor_cmd_${processId}.sh`);
+        fs.writeFileSync(scriptPath, scriptContent, 'utf-8');
+        fs.chmodSync(scriptPath, 0o755);
+        return scriptPath;
+    }
+
+    /**
      * Runs a Node.js script as a managed background process
      * @static
      * @param {string} filepathOrCode - File path to the script or JavaScript code string
@@ -967,6 +1314,7 @@ stop() {
             log: logPath,
             createdAt: new Date().toISOString(),
             status: 'running',
+            type: 'node_script', // Mark as Node.js script type
             config: {
                 autoRestart: !!config.autoRestart,
                 restartTries: config.restartTries || 0,
@@ -1039,6 +1387,8 @@ stop() {
                     id: proc.id,
                     name: proc.name,
                     pid: proc.pid,
+                    type: proc.type || 'node_script',
+                    command: proc.config?.command || proc.path,
                     monitorPid: proc.monitorPid || 'N/A',
                     tries: proc.config?.currentTries || 0,
                     autoRestart: proc.isAutoRestart ? 'Yes' : 'No',
@@ -1089,6 +1439,8 @@ stop() {
                 id: proc.id,
                 name: proc.name,
                 pid: proc.pid,
+                type: proc.type || 'node_script',
+                command: proc.config?.command || proc.path,
                 monitorPid: proc.monitorPid || 'N/A',
                 tries: proc.config?.currentTries || 0,
                 autoRestart: proc.isAutoRestart ? 'Yes' : 'No',
@@ -1191,7 +1543,8 @@ stop() {
             return false;
         }
        
-        console.log(`Killing process: ${proc.name} (ID: ${proc.id})${proc.isCluster ? ' [CLUSTER]' : ''}`);
+        const processType = proc.isGlobalCommand ? 'global command' : 'process';
+        console.log(`Killing ${processType}: ${proc.name} (ID: ${proc.id})${proc.isCluster ? ' [CLUSTER]' : ''}`);
        
         // Mark as stopped in registry first
         proc.status = 'stopped';
@@ -1225,9 +1578,9 @@ stop() {
         }
        
         if (killed) {
-            console.log(`✓ Successfully killed process: ${proc.name}`);
+            console.log(`✓ Successfully killed ${processType}: ${proc.name}`);
         } else {
-            console.log(`- Process ${proc.name} was not running`);
+            console.log(`- ${processType} ${proc.name} was not running`);
         }
         
         // Disable daemon mode if enabled
@@ -1545,7 +1898,8 @@ stop() {
             return;
         }
 
-        console.log(`🚀 Following logs for: ${proc.name} (ID: ${proc.id})`);
+        const processType = proc.isGlobalCommand ? 'Global Command' : 'Process';
+        console.log(`🚀 Following logs for: ${proc.name} (ID: ${proc.id}) - ${processType}`);
         console.log(`📁 Log file: ${logPath}`);
         if (proc.config?.workingDir) {
             console.log(`📁 Working directory: ${proc.config.workingDir}`);
@@ -1559,6 +1913,9 @@ stop() {
         if (proc.isCluster) {
             const numInstances = proc.config?.instances === 0 ? 'max' : proc.config?.instances;
             console.log(`⚡ Cluster mode: Enabled (${numInstances} instances)`);
+        }
+        if (proc.isGlobalCommand) {
+            console.log(`🌐 Global Command: ${proc.config?.command || proc.path}`);
         }
         console.log('=' .repeat(80));
         console.log('Press Ctrl+C to stop following logs\n');
@@ -1638,8 +1995,23 @@ stop() {
             return false;
         }
    
-        console.log(`Restarting process: ${proc.name} (ID: ${proc.id})${proc.isCluster ? ' [CLUSTER]' : ''}`);
+        const processType = proc.isGlobalCommand ? 'global command' : 'process';
+        console.log(`Restarting ${processType}: ${proc.name} (ID: ${proc.id})${proc.isCluster ? ' [CLUSTER]' : ''}`);
        
+        // Store configuration before killing
+        const savedConfig = {
+            name: proc.name,
+            autoRestart: proc.config.autoRestart,
+            restartTries: proc.config.restartTries,
+            workingDir: proc.config.workingDir,
+            daemon: proc.config.daemon,
+            uniqueNameLock: proc.config.uniqueNameLock,
+            command: proc.config.command,
+            instances: proc.config.instances,
+            originalPath: proc.originalPath,
+            isGlobalCommand: proc.isGlobalCommand
+        };
+        
         // Kill the current process
         this.kill(proc.id);
        
@@ -1648,31 +2020,55 @@ stop() {
             // Remove from registry
             this._removeFromRegistry(proc.id);
            
-            // Start a new process with the same configuration
-            const originalSource = proc.originalPath || proc.path;
-            const newProcess = this.run(originalSource, {
-                name: proc.name,
-                autoRestart: proc.config.autoRestart,
-                restartTries: proc.config.restartTries,
-                workingDir: proc.config.workingDir,
-                daemon: proc.config.daemon,
-                uniqueNameLock: proc.config.uniqueNameLock,
-                instances: proc.config.instances || 1
-            });
-           
-            console.log(`✓ Successfully restarted: ${newProcess.name} (New PID: ${newProcess.pid}, ID: ${newProcess.id})`);
-            if (newProcess.config.workingDir) {
-                console.log(`✓ Running in working directory: ${newProcess.config.workingDir}`);
-            }
-            if (newProcess.config.daemon) {
-                console.log(`✓ Daemon mode: Enabled`);
-            }
-            if (newProcess.config.uniqueNameLock) {
-                console.log(`✓ Unique name lock: Enabled`);
-            }
-            if (newProcess.isCluster) {
-                const numInstances = newProcess.config.instances === 0 ? 'max' : newProcess.config.instances;
-                console.log(`✓ Cluster mode: ${numInstances} instances`);
+            // Check if it's a global command
+            if (savedConfig.isGlobalCommand) {
+                // Restart the global command with all saved configuration
+                const newProcess = this.exec(savedConfig.command, {
+                    name: savedConfig.name,
+                    autoRestart: savedConfig.autoRestart,
+                    restartTries: savedConfig.restartTries,
+                    workingDir: savedConfig.workingDir,
+                    daemon: savedConfig.daemon,
+                    uniqueNameLock: savedConfig.uniqueNameLock
+                });
+                
+                console.log(`✓ Successfully restarted ${processType}: ${newProcess.name} (New PID: ${newProcess.pid}, ID: ${newProcess.id})`);
+                if (newProcess.config.workingDir) {
+                    console.log(`✓ Running in working directory: ${newProcess.config.workingDir}`);
+                }
+                if (newProcess.config.daemon) {
+                    console.log(`✓ Daemon mode: Enabled`);
+                }
+                if (newProcess.config.uniqueNameLock) {
+                    console.log(`✓ Unique name lock: Enabled`);
+                }
+            } else {
+                // Start a new process with the same configuration
+                const originalSource = savedConfig.originalPath || proc.path;
+                const newProcess = this.run(originalSource, {
+                    name: savedConfig.name,
+                    autoRestart: savedConfig.autoRestart,
+                    restartTries: savedConfig.restartTries,
+                    workingDir: savedConfig.workingDir,
+                    daemon: savedConfig.daemon,
+                    uniqueNameLock: savedConfig.uniqueNameLock,
+                    instances: savedConfig.instances || 1
+                });
+               
+                console.log(`✓ Successfully restarted: ${newProcess.name} (New PID: ${newProcess.pid}, ID: ${newProcess.id})`);
+                if (newProcess.config.workingDir) {
+                    console.log(`✓ Running in working directory: ${newProcess.config.workingDir}`);
+                }
+                if (newProcess.config.daemon) {
+                    console.log(`✓ Daemon mode: Enabled`);
+                }
+                if (newProcess.config.uniqueNameLock) {
+                    console.log(`✓ Unique name lock: Enabled`);
+                }
+                if (newProcess.isCluster) {
+                    const numInstances = newProcess.config.instances === 0 ? 'max' : newProcess.config.instances;
+                    console.log(`✓ Cluster mode: ${numInstances} instances`);
+                }
             }
         }, 1000);
        
@@ -1771,7 +2167,8 @@ stop() {
             if (this.isAlive(proc.id)) {
                 aliveProcesses.push(proc);
             } else {
-                console.log(`Cleaning up dead process: ${proc.name} (ID: ${proc.id})`);
+                const processType = proc.isGlobalCommand ? 'global command' : 'process';
+                console.log(`Cleaning up dead ${processType}: ${proc.name} (ID: ${proc.id})`);
                 
                 // Disable daemon mode if enabled
                 if (proc.config?.daemon) {
@@ -1793,8 +2190,13 @@ stop() {
                 // Also try to remove the monitor script if it exists
                 try {
                     const monitorScript = path.join(LOG_DIR, `monitor_${proc.id}.sh`);
+                    const cmdMonitorScript = path.join(LOG_DIR, `monitor_cmd_${proc.id}.sh`);
+                    
                     if (fs.existsSync(monitorScript)) {
                         fs.unlinkSync(monitorScript);
+                    }
+                    if (fs.existsSync(cmdMonitorScript)) {
+                        fs.unlinkSync(cmdMonitorScript);
                     }
                 } catch (error) {
                     // Ignore cleanup errors
@@ -1838,10 +2240,11 @@ stop() {
         console.log(`Daemon Processes: ${registry.filter(p => p.config?.daemon).length}`);
         console.log(`Unique Name Locked Processes: ${registry.filter(p => p.config?.uniqueNameLock).length}`);
         console.log(`Cluster Mode Processes: ${registry.filter(p => p.isCluster).length}`);
+        console.log(`Global Command Processes: ${registry.filter(p => p.isGlobalCommand).length}`);
     }
 
     /**
-     * Comprehensive test method to verify all SyPM functionality including daemon support
+     * Comprehensive test method to verify all SyPM functionality including daemon support and global commands
      * @static
      * @returns {Promise<boolean>} True if all tests pass
      * 
@@ -2387,6 +2790,270 @@ setInterval(() => {}, 1000);
             this.kill(process2.id);
         });
 
+        console.log('\n📋 Running Global Command Execution Tests:\n');
+
+        // Test 22: Execute simple global command
+        await runTest('Execute simple global command', async () => {
+            const process = this.exec('echo "Hello from global command"', {
+                name: 'test-global-cmd-simple'
+            });
+            
+            if (!process.isGlobalCommand) {
+                throw new Error('Process should be marked as global command');
+            }
+            
+            if (process.type !== 'global_command') {
+                throw new Error('Process type should be global_command');
+            }
+            
+            // Wait for command to complete
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Clean up
+            this.kill(process.id);
+        });
+
+        // Test 23: Execute global command with auto-restart
+        await runTest('Execute global command with auto-restart', async () => {
+            const process = this.exec('node -e "console.log(\'test\'); process.exit(1)"', {
+                name: 'test-global-cmd-restart',
+                autoRestart: true,
+                restartTries: 2
+            });
+            
+            if (!process.isGlobalCommand) {
+                throw new Error('Process should be marked as global command');
+            }
+            
+            if (!process.isAutoRestart) {
+                throw new Error('Process should have auto-restart enabled');
+            }
+            
+            // Wait for initial start
+            await waitFor(() => this.isAlive(process.id), 3000, 100);
+            
+            // Wait for some restart attempts
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
+            // Clean up
+            this.kill(process.id);
+        });
+
+        // Test 24: Execute global command with working directory
+        await runTest('Execute global command with working directory', async () => {
+            const testWorkingDir = path.join(tmpdir(), 'sypm_test_cmd_dir');
+            if (!fs.existsSync(testWorkingDir)) {
+                fs.mkdirSync(testWorkingDir, { recursive: true });
+            }
+            
+            const process = this.exec('echo "Running in specific directory"', {
+                name: 'test-global-cmd-dir',
+                workingDir: testWorkingDir
+            });
+            
+            if (!process.config.workingDir) {
+                throw new Error('Working directory not set in process config');
+            }
+            
+            if (process.config.workingDir !== testWorkingDir) {
+                throw new Error(`Working directory mismatch: ${process.config.workingDir} !== ${testWorkingDir}`);
+            }
+            
+            // Wait for command to complete
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Clean up
+            this.kill(process.id);
+            
+            try {
+                fs.rmdirSync(testWorkingDir);
+            } catch (error) {
+                // Ignore cleanup errors
+            }
+        });
+
+        // Test 25: Execute global command with unique name lock
+        await runTest('Execute global command with unique name lock', async () => {
+            const uniqueCmdName = 'test-unique-cmd';
+            
+            // Start first global command with unique name lock
+            const firstProcess = this.exec('node -e "setInterval(() => console.log(\'running\'), 1000)"', {
+                name: uniqueCmdName,
+                uniqueNameLock: true
+            });
+            
+            // Try to start second global command with same name - should fail
+            try {
+                const secondProcess = this.exec('echo "duplicate"', {
+                    name: uniqueCmdName,
+                    uniqueNameLock: true
+                });
+                throw new Error('Second global command should not have started with same locked name');
+            } catch (error) {
+                if (!error.message.includes('already in use and locked')) {
+                    throw new Error(`Unexpected error: ${error.message}`);
+                }
+                console.log(`\n     ✓ Correctly prevented duplicate global command: ${error.message}`);
+            }
+            
+            // Clean up
+            this.kill(firstProcess.id);
+            
+            // Wait for process to be killed
+            await waitFor(() => !this.isAlive(firstProcess.id), 3000, 100);
+        });
+
+        // Test 26: Execute various types of global commands
+        await runTest('Execute various types of global commands', async () => {
+            // Test Python command if available
+            try {
+                const pythonProcess = this.exec('python3 --version', {
+                    name: 'test-python-cmd'
+                });
+                
+                if (!pythonProcess.isGlobalCommand) {
+                    throw new Error('Python command process should be marked as global command');
+                }
+                
+                // Wait for command to complete
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                // Clean up
+                this.kill(pythonProcess.id);
+            } catch (error) {
+                console.log('\n     Python3 not available, skipping Python test');
+            }
+            
+            // Test npm command if available
+            try {
+                const npmProcess = this.exec('npm --version', {
+                    name: 'test-npm-cmd'
+                });
+                
+                if (!npmProcess.isGlobalCommand) {
+                    throw new Error('NPM command process should be marked as global command');
+                }
+                
+                // Wait for command to complete
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                
+                // Clean up
+                this.kill(npmProcess.id);
+            } catch (error) {
+                console.log('\n     NPM not available, skipping npm test');
+            }
+        });
+
+        // Test 27: Restart global command
+        await runTest('Restart global command', async () => {
+            const process = this.exec('node -e "setInterval(() => console.log(\'global cmd running\'), 5000)"', {
+                name: 'test-global-cmd-restart'
+            });
+            
+            const originalPid = process.pid;
+            
+            // Wait for process to start
+            await waitFor(() => this.isAlive(process.id), 3000, 100);
+            
+            const restartSuccess = this.restart(process.id);
+            
+            if (!restartSuccess) {
+                throw new Error('Global command restart failed');
+            }
+            
+            // Wait for restart to complete
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            const newProcesses = this.list();
+            const restartedProcess = newProcesses.find(p => p.name === 'test-global-cmd-restart');
+            
+            if (!restartedProcess) {
+                throw new Error('Restarted global command not found');
+            }
+            
+            if (restartedProcess.pid === originalPid) {
+                throw new Error('Global command PID did not change after restart');
+            }
+            
+            if (restartedProcess.type !== 'global_command') {
+                throw new Error('Restarted process should still be marked as global command');
+            }
+            
+            // Clean up
+            this.kill(restartedProcess.id);
+            
+            // Wait for process to be killed
+            await waitFor(() => !this.isAlive(restartedProcess.id), 3000, 100);
+        });
+
+        // Test 28: Mixed processes (Node.js scripts and global commands)
+        await runTest('Mixed processes management', async () => {
+            // Start a Node.js script
+            const nodeProcess = this.run(testScripts.long.code, {
+                name: 'test-mixed-node'
+            });
+            
+            // Start a global command
+            const cmdProcess = this.exec('node -e "setInterval(() => {}, 1000)"', {
+                name: 'test-mixed-cmd'
+            });
+            
+            // Check that both are in the list
+            const processes = this.list();
+            const nodeProc = processes.find(p => p.name === 'test-mixed-node');
+            const cmdProc = processes.find(p => p.name === 'test-mixed-cmd');
+            
+            if (!nodeProc) {
+                throw new Error('Node.js process not found in list');
+            }
+            
+            if (!cmdProc) {
+                throw new Error('Global command process not found in list');
+            }
+            
+            if (cmdProc.type !== 'global_command') {
+                throw new Error('Global command process should have type global_command');
+            }
+            
+            if (nodeProc.type !== 'node_script') {
+                throw new Error('Node.js process should have type node_script');
+            }
+            
+            // Clean up
+            this.kill(nodeProcess.id);
+            this.kill(cmdProcess.id);
+        });
+
+        // Test 29: List command shows global commands
+        await runTest('List command shows global commands correctly', () => {
+            const processes = this.list();
+            const globalCommands = processes.filter(p => p.type === 'global_command');
+            
+            // This test should not throw, just verify the structure
+            if (globalCommands.length > 0) {
+                const firstCmd = globalCommands[0];
+                if (!firstCmd.command) {
+                    throw new Error('Global command process should have command field');
+                }
+            }
+        });
+
+        // Test 30: Info shows global command count
+        await runTest('Info shows global command count', () => {
+            // Capture console output
+            const originalLog = console.log;
+            let output = '';
+            console.log = (msg) => { output += msg + '\n'; };
+            
+            this.info();
+            
+            console.log = originalLog;
+            
+            if (!output.includes('Global Command Processes')) {
+                throw new Error('Info should show Global Command Processes count');
+            }
+        });
+
         // Final cleanup
         this.killAll();
         cleanupTestScripts(testScripts);
@@ -2400,7 +3067,7 @@ setInterval(() => {}, 1000);
         console.log(`Success Rate: ${((passedTests / testCount) * 100).toFixed(1)}%`);
         
         if (failedTests === 0) {
-            console.log('\n🎉 ALL TESTS PASSED! SyPM is working correctly.');
+            console.log('\n🎉 ALL TESTS PASSED! SyPM is working correctly with global command support.');
             return true;
         } else {
             console.log('\n⚠️  Some tests failed. Please check the implementation.');
@@ -2422,6 +3089,7 @@ setInterval(() => {}, 1000);
     
     Commands:
       --run <file>          Run a Node.js script as a background process
+      --exec <command>      Execute a global command line as a managed process
       --list                List all managed processes (global)
       --kill <pid|id|name>  Kill a process by PID, ID, or unique name
       --kill-all            Stop all managed processes and remove from registry
@@ -2444,6 +3112,14 @@ setInterval(() => {}, 1000);
       --unique-name-lock    Lock the process name as unique (prevent duplicates)
       --instances <n>       Number of cluster instances (0 = max CPUs, 1 = single)
     
+    Options for --exec:
+      --name <name>         Specify a name for the command process
+      --auto-restart        Auto-restart the command if it crashes
+      --restart-tries <n>   Number of restart attempts (implies auto-restart)
+      --working-dir <path>  Run the command in specified working directory
+      --daemon              Run as system daemon (auto-start on system boot)
+      --unique-name-lock    Lock the process name as unique (prevent duplicates)
+    
     Global Features:
       • Processes are managed system-wide from: ${GLOBAL_BASE_DIR}
       • Access process list from any directory
@@ -2457,6 +3133,13 @@ setInterval(() => {}, 1000);
       • Kill and check alive status by unique name
       • Follow logs for all processes simultaneously
       • Cluster mode for multi-core scaling (like PM2 -i max)
+      • Execute any global command line as a managed process
+    
+    Global Command Execution Examples:
+      node SyPM --exec "ls -la" --name list-files
+      node SyPM --exec "python3 server.py" --working-dir /path/to/project --auto-restart
+      node SyPM --exec "npm run dev" --name dev-server --unique-name-lock
+      node SyPM --exec "node -e 'setInterval(() => console.log(\"running\"), 1000)'" --name my-script
     
     Cluster Mode Examples:
       node SyPM --run app.js --instances 0        # Use all CPU cores (like PM2 -i max)
@@ -2518,6 +3201,87 @@ setInterval(() => {}, 1000);
                 console.log('No processes found.');
             } else {
                 console.table(processes);
+            }
+            return;
+        }
+    
+        // Handle --exec command (global command execution)
+        if (args.includes('--exec')) {
+            const execIndex = args.indexOf('--exec');
+            if (execIndex + 1 >= args.length || args[execIndex + 1].startsWith('--')) {
+                console.error('Error: --exec requires a command to execute');
+                return;
+            }
+            
+            // Get the command - it might span multiple arguments until the next --option
+            let commandArgs = [];
+            let i = execIndex + 1;
+            while (i < args.length && !args[i].startsWith('--')) {
+                commandArgs.push(args[i]);
+                i++;
+            }
+            
+            const command = commandArgs.join(' ');
+            const config = {};
+            
+            // Parse configuration options
+            if (args.includes('--name')) {
+                const nameIndex = args.indexOf('--name');
+                if (nameIndex + 1 < args.length && !args[nameIndex + 1].startsWith('--')) {
+                    config.name = args[nameIndex + 1];
+                }
+            }
+            
+            if (args.includes('--auto-restart')) {
+                config.autoRestart = true;
+            }
+            
+            if (args.includes('--restart-tries')) {
+                const triesIndex = args.indexOf('--restart-tries');
+                if (triesIndex + 1 < args.length && !args[triesIndex + 1].startsWith('--')) {
+                    const tries = parseInt(args[triesIndex + 1]);
+                    if (!isNaN(tries) && tries > 0) {
+                        config.restartTries = tries;
+                        config.autoRestart = true;
+                    }
+                }
+            }
+    
+            if (args.includes('--working-dir')) {
+                const dirIndex = args.indexOf('--working-dir');
+                if (dirIndex + 1 < args.length && !args[dirIndex + 1].startsWith('--')) {
+                    config.workingDir = args[dirIndex + 1];
+                }
+            }
+    
+            if (args.includes('--daemon')) {
+                config.daemon = true;
+            }
+    
+            if (args.includes('--unique-name-lock')) {
+                config.uniqueNameLock = true;
+            }
+            
+            try {
+                const result = this.exec(command, config);
+                console.log(`✓ Started global command: ${result.name} (PID: ${result.pid}, ID: ${result.id})`);
+                console.log(`✓ Command: ${command}`);
+                console.log(`✓ Global registry: ${PROCESS_REGISTRY}`);
+                if (config.autoRestart) {
+                    console.log(`✓ Auto-restart enabled${config.restartTries ? ` with ${config.restartTries} tries` : ''}`);
+                }
+                if (config.workingDir) {
+                    console.log(`✓ Working directory: ${config.workingDir}`);
+                }
+                if (config.daemon) {
+                    console.log(`✓ Daemon mode: Enabled (auto-start on system boot)`);
+                }
+                if (config.uniqueNameLock) {
+                    console.log(`✓ Unique name lock: Enabled (no duplicate names allowed)`);
+                    console.log(`✓ You can now use "${result.name}" with --alive and --kill commands`);
+                }
+            } catch (error) {
+                console.error('✗ Error executing command:', error.message);
             }
             return;
         }
