@@ -2244,6 +2244,199 @@ main
     }
 
     /**
+     * Opens a real-time monitoring dashboard for all managed processes
+     * @static
+     * 
+     * @example
+     * // Start real-time monitoring
+     * SyPM.monit();
+     */
+    static monit() {
+        // Clear the screen
+        process.stdout.write('\x1Bc');
+        
+        let isRunning = true;
+        
+        // Handle cleanup on exit
+        const cleanup = () => {
+            isRunning = false;
+            process.stdout.write('\x1B[?25h'); // Show cursor
+            console.log('\n\n📊 Monitoring stopped.');
+            process.exit(0);
+        };
+        
+        process.on('SIGINT', cleanup);
+        process.on('SIGTERM', cleanup);
+        
+        // Hide cursor
+        process.stdout.write('\x1B[?25l');
+        
+        const refreshInterval = 1000; // 1 second refresh
+        
+        /**
+         * Formats uptime for a process
+         * @param {string} createdAt - ISO date string of process creation
+         * @returns {string} Formatted uptime string
+         */
+        const formatUptime = (createdAt) => {
+            const start = new Date(createdAt);
+            const now = new Date();
+            const diff = Math.floor((now - start) / 1000); // seconds
+            
+            if (diff < 60) return `${diff}s`;
+            if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+            if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
+            return `${Math.floor(diff / 86400)}d`;
+        };
+        
+        /**
+         * Gets memory usage for a process by PID
+         * @param {number} pid - Process ID
+         * @returns {string} Formatted memory usage
+         */
+        const getMemoryUsage = (pid) => {
+            try {
+                if (os.platform() === 'win32') {
+                    const output = execSync(`wmic process where ProcessId=${pid} get WorkingSetSize 2>nul`, { encoding: 'utf-8' });
+                    const lines = output.split('\n').filter(line => line.trim());
+                    if (lines.length > 1) {
+                        const memBytes = parseInt(lines[1].trim());
+                        if (!isNaN(memBytes)) {
+                            return `${(memBytes / 1024 / 1024).toFixed(1)} MB`;
+                        }
+                    }
+                } else {
+                    const output = execSync(`ps -o rss= -p ${pid} 2>/dev/null`, { encoding: 'utf-8' });
+                    const memKB = parseInt(output.trim());
+                    if (!isNaN(memKB)) {
+                        return `${(memKB / 1024).toFixed(1)} MB`;
+                    }
+                }
+            } catch (error) {
+                // Process might not exist or permission denied
+            }
+            return 'N/A';
+        };
+        
+        /**
+         * Gets CPU usage for a process by PID (simplified)
+         * @param {number} pid - Process ID
+         * @returns {string} Formatted CPU usage percentage
+         */
+        const getCPUUsage = (pid) => {
+            try {
+                if (os.platform() !== 'win32') {
+                    const output = execSync(`ps -o %cpu= -p ${pid} 2>/dev/null`, { encoding: 'utf-8' });
+                    const cpuPercent = parseFloat(output.trim());
+                    if (!isNaN(cpuPercent)) {
+                        return `${cpuPercent.toFixed(1)}%`;
+                    }
+                }
+            } catch (error) {
+                // Process might not exist or permission denied
+            }
+            return 'N/A';
+        };
+        
+        /**
+         * Renders the monitoring dashboard
+         */
+        const renderDashboard = () => {
+            if (!isRunning) return;
+            
+            // Move cursor to top-left
+            process.stdout.write('\x1B[H');
+            
+            // Get system info
+            const systemInfo = this._detectSystem();
+            const totalMem = os.totalmem();
+            const freeMem = os.freemem();
+            const usedMem = totalMem - freeMem;
+            const memPercent = ((usedMem / totalMem) * 100).toFixed(1);
+            
+            // Get process list
+            const processes = this.list();
+            const aliveCount = processes.filter(p => 
+                p.status === 'Running' || p.status === 'Restarting'
+            ).length;
+            
+            // Header
+            console.log('╔════════════════════════════════════════════════════════════════════════════════╗');
+            console.log('║                          SyPM Process Monitor                                   ║');
+            console.log('╠════════════════════════════════════════════════════════════════════════════════╣');
+            console.log(`║  OS: ${systemInfo.platform.padEnd(15)} | CPU Cores: ${String(os.cpus().length).padEnd(6)} | Memory: ${memPercent}% used         ║`);
+            console.log(`║  Total Processes: ${String(processes.length).padEnd(3)} | Alive: ${String(aliveCount).padEnd(3)} | Dead: ${String(processes.length - aliveCount).padEnd(3)}                      ║`);
+            console.log('╠════════════════════════════════════════════════════════════════════════════════╣');
+            
+            if (processes.length === 0) {
+                console.log('║                        No processes currently managed                            ║');
+            } else {
+                // Column headers
+                console.log('║ Name                 │ PID    │ Status    │ Uptime │ Memory  │ CPU  │ Type       ║');
+                console.log('╟──────────────────────┼────────┼───────────┼────────┼─────────┼──────┼────────────╢');
+                
+                // Process rows
+                for (const proc of processes) {
+                    const name = proc.name.substring(0, 20).padEnd(20);
+                    const pid = String(proc.pid).padEnd(6);
+                    
+                    // Color-code status
+                    let statusStr;
+                    switch (proc.status) {
+                        case 'Running':
+                            statusStr = '\x1b[32mRunning\x1b[0m    ';
+                            break;
+                        case 'Restarting':
+                            statusStr = '\x1b[33mRestarting\x1b[0m ';
+                            break;
+                        case 'Dead':
+                            statusStr = '\x1b[31mDead\x1b[0m       ';
+                            break;
+                        case 'Stopped':
+                            statusStr = '\x1b[90mStopped\x1b[0m    ';
+                            break;
+                        default:
+                            statusStr = proc.status.padEnd(9);
+                    }
+                    
+                    const uptime = proc.createdAt ? formatUptime(proc.createdAt).padEnd(6) : 'N/A   ';
+                    const memory = getMemoryUsage(proc.pid).padEnd(7);
+                    const cpu = getCPUUsage(proc.pid).padEnd(4);
+                    const type = (proc.type || 'node_script').substring(0, 10).padEnd(10);
+                    
+                    console.log(`║ ${name} │ ${pid} │ ${statusStr}│ ${uptime} │ ${memory} │ ${cpu} │ ${type} ║`);
+                }
+            }
+            
+            // Footer
+            console.log('╠════════════════════════════════════════════════════════════════════════════════╣');
+            console.log('║  Press Ctrl+C to exit                                                          ║');
+            console.log(`║  Last update: ${new Date().toLocaleTimeString()}                                                     ║`);
+            console.log('╚════════════════════════════════════════════════════════════════════════════════╝');
+        };
+        
+        // Initial render and set interval for updates
+        renderDashboard();
+        const interval = setInterval(renderDashboard, refreshInterval);
+        
+        // Override cleanup to clear interval
+        const originalCleanup = cleanup;
+        process.removeAllListeners('SIGINT');
+        process.removeAllListeners('SIGTERM');
+        
+        const enhancedCleanup = () => {
+            clearInterval(interval);
+            originalCleanup();
+        };
+        
+        process.on('SIGINT', enhancedCleanup);
+        process.on('SIGTERM', enhancedCleanup);
+        
+        // Keep the process alive
+        process.stdin.resume();
+    }
+
+    /**
      * Comprehensive test method to verify all SyPM functionality including daemon support and global commands
      * @static
      * @returns {Promise<boolean>} True if all tests pass
@@ -3091,6 +3284,7 @@ setInterval(() => {}, 1000);
       --run <file>          Run a Node.js script as a background process
       --exec <command>      Execute a global command line as a managed process
       --list                List all managed processes (global)
+      --monit               Open real-time process monitoring dashboard
       --kill <pid|id|name>  Kill a process by PID, ID, or unique name
       --kill-all            Stop all managed processes and remove from registry
       --restart <pid|id>    Restart a process by PID or ID
@@ -3134,6 +3328,10 @@ setInterval(() => {}, 1000);
       • Follow logs for all processes simultaneously
       • Cluster mode for multi-core scaling (like PM2 -i max)
       • Execute any global command line as a managed process
+      • Real-time monitoring dashboard with process metrics
+    
+    Real-time Monitoring Examples:
+      node SyPM --monit                      # Open real-time process dashboard
     
     Global Command Execution Examples:
       node SyPM --exec "ls -la" --name list-files
@@ -3162,6 +3360,7 @@ setInterval(() => {}, 1000);
       node SyPM --log                    # Follow logs for all processes
       node SyPM --log abc123def          # Follow logs for specific process
       node SyPM --list                   # Shows all processes regardless of current directory
+      node SyPM --monit                  # Open real-time process monitoring dashboard
       node SyPM --test                   # Run comprehensive test suite
             `);
     }
@@ -3202,6 +3401,11 @@ setInterval(() => {}, 1000);
             } else {
                 console.table(processes);
             }
+            return;
+        }
+    
+        if (args.includes('--monit')) {
+            this.monit();
             return;
         }
     
