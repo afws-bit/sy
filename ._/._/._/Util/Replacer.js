@@ -254,12 +254,32 @@ async function askQuestion(query) {
 // ----------------------------------------------------------------------
 async function main() {
   const args = process.argv.slice(2);
+  let inputFile;
+
   if (args.length === 0) {
-    console.error('Usage: node replace-codes.mjs <input-file>');
-    process.exit(1);
+    // Look for default file(s): "result" or "result.txt"
+    const defaults = ['result', 'result.txt'];
+    let found = null;
+    for (const def of defaults) {
+      try {
+        await fs.access(def); // checks existence
+        found = def;
+        break;
+      } catch {
+        // not found, try next
+      }
+    }
+    if (!found) {
+      console.error('Usage: node replace-codes.mjs <input-file>');
+      console.error('Or ensure a default file "result" or "result.txt" exists in the current directory.');
+      process.exit(1);
+    }
+    inputFile = found;
+    console.log(`No input file specified, using default file "${found}".`);
+  } else {
+    inputFile = args[0];
   }
 
-  const inputFile = args[0];
   let text;
   try {
     text = await fs.readFile(inputFile, 'utf8');
