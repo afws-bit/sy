@@ -495,6 +495,16 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
     // Other is what's left after subtracting all categorized sizes
     const otherSize = this.totalSize - this.codeSize - this.binarySize - this.archiveSize;
     
+    // FIXED: Code Purity Rate = (Pure Code / Analyzed Size) * 100
+    const codePurityRate = this.totalSize > 0 
+      ? ((this.codeSize / this.totalSize) * 100).toFixed(2)
+      : '0.00';
+    
+    // Calculate Repository Efficiency Rate: (analyzed size / real total size) * 100
+    const repositoryEfficiencyRate = this.realTotalSize > 0 
+      ? ((this.totalSize / this.realTotalSize) * 100).toFixed(2)
+      : '100.00';
+    
     return {
       totalSize: this.totalSize,
       totalSizeFormatted: formatSize(this.totalSize),
@@ -523,7 +533,9 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
       fileCount: this.fileCount,
       dirCount: this.dirCount,
       skippedDirs: [...new Set(this.skippedDirs)],
-      skippedCount: this.skippedCount
+      skippedCount: this.skippedCount,
+      codePurityRate: `${codePurityRate}%`,
+      repositoryEfficiencyRate: `${repositoryEfficiencyRate}%`
     };
   }
 
@@ -605,7 +617,10 @@ class PackageJsonAnalyzer extends BaseAnalyzer {
   getReport() {
     const totalFiles = this.packageJsonFiles.length;
     const pureProjects = totalFiles - this.projectsWithDeps;
-    const purityPercentage = totalFiles > 0 ? (pureProjects / totalFiles * 100).toFixed(2) : '0.00';
+    // FIXED: When no package.json files exist, purity should be 100%
+    const purityPercentage = totalFiles > 0 
+      ? (pureProjects / totalFiles * 100).toFixed(2) 
+      : '100.00';
     
     return {
       totalFiles,
@@ -1379,6 +1394,8 @@ async function processSingleDirectory(targetDir) {
     { label: '├─ .git Directory', value: sizeReport.gitSizeFormatted, color: colors.magenta },
     { label: '├─ Ignored Dirs', value: sizeReport.ignoredDirsSizeFormatted, color: colors.dim },
     { label: '└─ Other', value: sizeReport.otherSizeFormatted, color: colors.dim },
+    { label: '💎 Code Purity Rate', value: sizeReport.codePurityRate, color: colors.bright + colors.cyan },
+    { label: '⚡ Repo Efficiency', value: sizeReport.repositoryEfficiencyRate, color: colors.bright + colors.green },
     { label: 'Files Scanned', value: sizeReport.fileCount.toLocaleString(), color: colors.cyan },
     { label: 'Directories', value: sizeReport.dirCount.toLocaleString(), color: colors.cyan }
   ];
@@ -1416,7 +1433,7 @@ async function processSingleDirectory(targetDir) {
       pkgReport.purityPercentage > 80 ? colors.green : pkgReport.purityPercentage > 50 ? colors.yellow : colors.red);
     console.log(`   ${pkgReport.pureProjects} pure projects (no production deps)`);
   } else {
-    console.log(`  ${colors.yellow}No package.json files found${colors.reset}`);
+    console.log(`  ${colors.green}✓ No package.json files found - 100% Pure${colors.reset}`);
   }
   
   // Lines of Code Report
@@ -1504,7 +1521,9 @@ async function processSingleDirectory(targetDir) {
     { icon: '📦', label: 'Archive', value: `${archiveReport.totalCount} files (${sizeReport.archiveSizeFormatted})`, color: colors.yellow },
     { icon: '🔧', label: '.git', value: sizeReport.gitSizeFormatted, color: colors.magenta },
     { icon: '📊', label: 'Lines', value: locReport.totalLinesFormatted, color: colors.green },
-    { icon: '📋', label: 'Files', value: sizeReport.fileCount.toLocaleString(), color: colors.cyan }
+    { icon: '📋', label: 'Files', value: sizeReport.fileCount.toLocaleString(), color: colors.cyan },
+    { icon: '💎', label: 'Code Purity', value: sizeReport.codePurityRate, color: colors.bright + colors.cyan },
+    { icon: '⚡', label: 'Repo Efficiency', value: sizeReport.repositoryEfficiencyRate, color: colors.bright + colors.green }
   ];
   
   if (gitReport && gitReport.totalRepositories > 0) {
@@ -1632,6 +1651,8 @@ async function processMultipleDirectories(directories) {
     { label: 'Binary Size', key: 'binarySizeFormatted', winner: 'smallest', getValue: (r) => r.binarySizeFormatted },
     { label: 'Archive Size', key: 'archiveSizeFormatted', winner: 'smallest', getValue: (r) => r.archiveSizeFormatted },
     { label: '.git Size', key: 'gitSizeFormatted', winner: 'smallest', getValue: (r) => r.gitSizeFormatted },
+    { label: '💎 Code Purity', key: 'codePurityRate', winner: 'largest', getValue: (r) => r.codePurityRate },
+    { label: '⚡ Repo Efficiency', key: 'repositoryEfficiencyRate', winner: 'largest', getValue: (r) => r.repositoryEfficiencyRate },
     { label: 'Files', key: 'fileCount', winner: 'largest', getValue: (r) => r.fileCount.toLocaleString() },
     { label: 'Directories', key: 'dirCount', winner: 'largest', getValue: (r) => r.dirCount.toLocaleString() }
   ];
@@ -1722,6 +1743,9 @@ async function processMultipleDirectories(directories) {
       }
       if (metric.key === 'totalFiles' || metric.key === 'totalDeps' || metric.key === 'purityPercentage') {
         return parseFloat(flattenedReports[dir]['Package.json Analyzer'][metric.key]) || 0;
+      }
+      if (metric.key === 'codePurityRate' || metric.key === 'repositoryEfficiencyRate') {
+        return parseFloat(flattenedReports[dir][metric.key]) || 0;
       }
       if (metric.key === 'totalCount') {
         if (metric.label.includes('Archive')) {
