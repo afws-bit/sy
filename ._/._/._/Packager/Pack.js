@@ -96,7 +96,6 @@ const ARCHIVE_EXTENSIONS = new Set([
 ]);
 
 // Binary file extensions
-// FIXED: Removed '.ts' which is a TypeScript/Video conflict
 const BINARY_EXTENSIONS = new Set([
   '.exe', '.dll', '.so', '.dylib', '.bin', '.out', '.elf', '.app',
   '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg', '.webp', '.tiff', '.psd',
@@ -115,7 +114,6 @@ const BINARY_EXTENSIONS = new Set([
   '.class', '.dex', '.odex'
 ]);
 
-// FIXED: Added priority check - code extensions that might overlap with binary/media extensions
 const CODE_EXTENSIONS_PRIORITY = new Set([
   '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
   '.py', '.py3', '.pyw',
@@ -129,11 +127,6 @@ const CODE_EXTENSIONS_PRIORITY = new Set([
 
 // ===== EXTENSION HANDLING FUNCTIONS =====
 
-/**
- * Gets the final extension from a filename.
- * For 'file-12-one-example.ts' returns '.ts'
- * For 'Dockerfile' returns 'Dockerfile'
- */
 function getFinalExtension(filePath) {
   const filename = path.basename(filePath);
   
@@ -158,9 +151,6 @@ function getFinalExtension(filePath) {
   return filename.substring(lastDotIndex).toLowerCase();
 }
 
-/**
- * Checks if a filename matches a specific extension.
- */
 function filenameMatchesExtension(filename, extension) {
   const name = path.basename(filename);
   const nameLowerCase = name.toLowerCase();
@@ -177,9 +167,6 @@ function filenameMatchesExtension(filename, extension) {
   return nameLowerCase === extensionLowerCase;
 }
 
-/**
- * Checks if a filename matches any extension in a collection.
- */
 function filenameMatchesAnyExtension(filename, extensions) {
   const extensionList = extensions instanceof Set ? [...extensions] : extensions;
   
@@ -192,9 +179,6 @@ function filenameMatchesAnyExtension(filename, extensions) {
   return false;
 }
 
-/**
- * Detects the programming language of a file.
- */
 function detectFileLanguage(filename) {
   for (const [language, extensions] of Object.entries(LANGUAGE_EXTENSIONS)) {
     if (filenameMatchesAnyExtension(filename, extensions)) {
@@ -204,19 +188,290 @@ function detectFileLanguage(filename) {
   return null;
 }
 
-/**
- * Check if a file is an archive.
- */
 function isArchiveFile(filename) {
   return filenameMatchesAnyExtension(filename, ARCHIVE_EXTENSIONS);
 }
 
-/**
- * FIXED: Check if file extension is a known code extension (takes priority over binary).
- */
 function isCodeExtension(filename) {
   const extension = getFinalExtension(filename);
   return CODE_EXTENSIONS_PRIORITY.has(extension);
+}
+
+// ===== EMAIL NORMALIZATION AND DEDUPLICATION FUNCTIONS =====
+
+/**
+ * Generic/system emails to exclude from contributor counting
+ */
+const GENERIC_EMAILS = new Set([
+  'root@localhost',
+  'root@local',
+  'root@localhost.localdomain',
+  'root@server',
+  'admin@localhost',
+  'admin@local',
+  'administrator@localhost',
+  'user@localhost',
+  'user@local',
+  'test@localhost',
+  'test@test.com',
+  'test@example.com',
+  'example@example.com',
+  'noreply@example.com',
+  'noreply@localhost',
+  'noreply@noreply.com',
+  'no-reply@example.com',
+  'no-reply@localhost',
+  'git@localhost',
+  'git@local',
+  'dev@localhost',
+  'developer@localhost',
+  'unknown@localhost',
+  'unknown@unknown',
+  'none@none.com',
+  'null@null.com',
+  'default@default.com',
+  'user@example.com',
+  'user@domain.com',
+  'email@example.com',
+  'mail@example.com',
+  'contact@example.com',
+  'info@example.com',
+  'support@example.com'
+]);
+
+/**
+ * Generic usernames to exclude
+ */
+const GENERIC_USERNAMES = new Set([
+  'root', 'admin', 'administrator', 'user', 'test', 'guest', 'anonymous',
+  'unknown', 'none', 'null', 'default', 'system', 'local', 'localhost',
+  'dev', 'developer', 'git', 'svn', 'webmaster', 'postmaster', 'noreply',
+  'no-reply', 'nobody', 'example', 'sample', 'demo'
+]);
+
+/**
+ * Normalize email for unique contributor counting
+ * Handles common typos and variations in email addresses
+ */
+function normalizeEmail(email) {
+  if (!email || typeof email !== 'string') {
+    return '';
+  }
+  
+  let normalized = email.trim().toLowerCase();
+  
+  // Remove common email variations
+  normalized = normalized.replace(/\s+/g, '');
+  
+  // Handle Gmail specific normalization (dots don't matter in Gmail)
+  const gmailMatch = normalized.match(/^([^@]+)@gmail\.com$/);
+  if (gmailMatch) {
+    // Remove all dots from Gmail username
+    normalized = gmailMatch[1].replace(/\./g, '') + '@gmail.com';
+  }
+  
+  // Handle common typos in domain names
+  const domainTypos = {
+    'gmial.com': 'gmail.com',
+    'gmal.com': 'gmail.com',
+    'gmail.co': 'gmail.com',
+    'gmail.cm': 'gmail.com',
+    'gmai.com': 'gmail.com',
+    'hotmial.com': 'hotmail.com',
+    'hotmal.com': 'hotmail.com',
+    'hotmail.co': 'hotmail.com',
+    'outlook.co': 'outlook.com',
+    'outlok.com': 'outlook.com',
+    'yahoo.co': 'yahoo.com',
+    'yaho.com': 'yahoo.com',
+    'protonmail.co': 'protonmail.com',
+    'icloud.co': 'icloud.com',
+    'iclod.com': 'icloud.com'
+  };
+  
+  // Replace common domain typos
+  const [username, domain] = normalized.split('@');
+  if (username && domain && domainTypos[domain]) {
+    normalized = `${username}@${domainTypos[domain]}`;
+  }
+  
+  return normalized;
+}
+
+/**
+ * Check if email should be excluded (generic/system emails)
+ */
+function isGenericEmail(email) {
+  if (!email || typeof email !== 'string') {
+    return true;
+  }
+  
+  const normalized = normalizeEmail(email);
+  
+  // Check if it's in the generic emails set
+  if (GENERIC_EMAILS.has(normalized)) {
+    return true;
+  }
+  
+  // Extract username and domain
+  const [username, domain] = normalized.split('@');
+  
+  if (!username || !domain) {
+    return true;
+  }
+  
+  // Check if username is generic
+  if (GENERIC_USERNAMES.has(username)) {
+    return true;
+  }
+  
+  // Check for generic username patterns
+  if (username.length < 2 || /^\d+$/.test(username)) {
+    return true;
+  }
+  
+  // Check for generic local domains
+  const genericDomains = new Set([
+    'localhost', 'local', 'localhost.localdomain', 'localdomain',
+    '127.0.0.1', '0.0.0.0', 'example.com', 'test.com', 'domain.com'
+  ]);
+  
+  if (genericDomains.has(domain)) {
+    return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Calculate Levenshtein distance for fuzzy email matching
+ */
+function levenshteinDistance(str1, str2) {
+  const track = Array(str2.length + 1).fill(null).map(() =>
+    Array(str1.length + 1).fill(null));
+  
+  for (let i = 0; i <= str1.length; i += 1) {
+    track[0][i] = i;
+  }
+  
+  for (let j = 0; j <= str2.length; j += 1) {
+    track[j][0] = j;
+  }
+  
+  for (let j = 1; j <= str2.length; j += 1) {
+    for (let i = 1; i <= str1.length; i += 1) {
+      const indicator = str1[i - 1] === str2[j - 1] ? 0 : 1;
+      track[j][i] = Math.min(
+        track[j][i - 1] + 1,
+        track[j - 1][i] + 1,
+        track[j - 1][i - 1] + indicator
+      );
+    }
+  }
+  
+  return track[str2.length][str1.length];
+}
+
+/**
+ * Check if two emails are likely the same person
+ * ROBUST: Uses stricter matching criteria to reduce false positives
+ */
+function areEmailsSimilar(email1, email2) {
+  if (!email1 || !email2) return false;
+  
+  const normalized1 = normalizeEmail(email1);
+  const normalized2 = normalizeEmail(email2);
+  
+  // Exact match after normalization
+  if (normalized1 === normalized2) {
+    return true;
+  }
+  
+  // Split into username and domain
+  const [username1, domain1] = normalized1.split('@');
+  const [username2, domain2] = normalized2.split('@');
+  
+  if (!username1 || !username2 || !domain1 || !domain2) {
+    return false;
+  }
+  
+  // Same domain, similar username (likely typo)
+  if (domain1 === domain2) {
+    const distance = levenshteinDistance(username1, username2);
+    const maxLength = Math.max(username1.length, username2.length);
+    const similarityRatio = 1 - (distance / maxLength);
+    
+    // Only consider similar if:
+    // 1. Distance is very small (1 character)
+    // 2. Usernames are reasonably long (at least 4 characters)
+    // 3. Similarity ratio is high (> 80%)
+    if (username1.length >= 4 && username2.length >= 4) {
+      if (distance === 1 && similarityRatio >= 0.85) {
+        return true;
+      }
+    }
+    
+    // For very short usernames, require exact match
+    if (distance <= 1 && Math.abs(username1.length - username2.length) <= 1 && username1.length >= 5) {
+      return true;
+    }
+  }
+  
+  // Similar domain (likely typo in domain) - but only for long usernames
+  if (username1 === username2 && username1.length >= 5) {
+    const domainDistance = levenshteinDistance(domain1, domain2);
+    if (domainDistance === 1) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * Deduplicate contributors based on email similarity
+ * ROBUST: Excludes generic emails and uses stricter matching
+ */
+function deduplicateContributors(contributors) {
+  const uniqueContributors = [];
+  const seenEmails = new Set();
+  
+  for (const contributor of contributors) {
+    // Skip generic/system emails
+    if (isGenericEmail(contributor.email)) {
+      continue;
+    }
+    
+    // Skip if we've already seen this exact email
+    const normalizedEmail = normalizeEmail(contributor.email);
+    if (seenEmails.has(normalizedEmail)) {
+      continue;
+    }
+    
+    let isDuplicate = false;
+    
+    // Check for similar emails in existing unique contributors
+    for (const existing of uniqueContributors) {
+      if (areEmailsSimilar(contributor.email, existing.email)) {
+        // Merge contributor info, prefer the one with more complete info
+        if (contributor.name && !existing.name) {
+          existing.name = contributor.name;
+        }
+        isDuplicate = true;
+        break;
+      }
+    }
+    
+    if (!isDuplicate) {
+      uniqueContributors.push({ 
+        name: contributor.name || 'Unknown', 
+        email: normalizedEmail 
+      });
+      seenEmails.add(normalizedEmail);
+    }
+  }
+  
+  return uniqueContributors;
 }
 
 // Helper to format bytes to human readable
@@ -227,23 +482,19 @@ function formatSize(bytes) {
   return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
 }
 
-// Helper to format bytes to MB with 2 decimals
 function formatMB(bytes) {
   return (bytes / (1024 * 1024)).toFixed(2);
 }
 
-// Helper to truncate string with ellipsis
 function truncate(str, maxLength) {
   if (str.length <= maxLength) return str;
   return str.slice(0, maxLength - 3) + '...';
 }
 
-// Helper to create a horizontal line
 function horizontalLine(char = '─', color = colors.dim) {
   return color + char.repeat(terminalWidth - 1) + colors.reset;
 }
 
-// Helper to center text
 function centerText(text, width = terminalWidth) {
   const padding = Math.max(0, Math.floor((width - text.length) / 2));
   return ' '.repeat(padding) + text;
@@ -251,9 +502,6 @@ function centerText(text, width = terminalWidth) {
 
 // ===== GENERIC BINARY DETECTION =====
 
-/**
- * GENERIC: Quick check for binary content (looks for null bytes)
- */
 async function isBinaryContent(filePath, stats) {
   if (stats.size < 1024) return false;
   
@@ -277,20 +525,13 @@ async function isBinaryContent(filePath, stats) {
   }
 }
 
-/**
- * GENERIC: Main function to determine if a file is binary
- * FIXED: Code extensions take priority over binary detection
- */
 async function isBinaryFile(filePath, stats) {
   const filename = path.basename(filePath);
   
-  // FIXED: If this is a known code extension, it's NOT binary
-  // even if the extension appears in BINARY_EXTENSIONS
   if (isCodeExtension(filename)) {
     return false;
   }
   
-  // Check using centralized extension matching
   if (filenameMatchesAnyExtension(filename, BINARY_EXTENSIONS)) {
     return true;
   }
@@ -312,16 +553,10 @@ async function isBinaryFile(filePath, stats) {
   return false;
 }
 
-/**
- * NEW: Calculate real directory size including all files (even ignored ones)
- * Gets actual file sizes, not disk usage
- */
 async function getRealDirectorySize(dirPath) {
   try {
-    // Try using find + du for accurate byte count on Unix
     if (process.platform !== 'win32') {
       try {
-        // Method 1: Use find with -type f and stat to sum actual file sizes
         const { stdout } = await execPromise(`find "${dirPath}" -type f -exec stat -f%z {} \\; 2>/dev/null | awk '{sum+=$1} END {print sum}'`, {
           encoding: 'utf8',
           maxBuffer: 10 * 1024 * 1024,
@@ -333,7 +568,6 @@ async function getRealDirectorySize(dirPath) {
           return size;
         }
       } catch (findError) {
-        // Try alternative method for Linux
         try {
           const { stdout } = await execPromise(`find "${dirPath}" -type f -exec stat -c%s {} \\; 2>/dev/null | awk '{sum+=$1} END {print sum}'`, {
             encoding: 'utf8',
@@ -351,7 +585,6 @@ async function getRealDirectorySize(dirPath) {
       }
     }
     
-    // Manual calculation as fallback (accurate but slower)
     let totalSize = 0;
     
     async function calculateSize(currentPath) {
@@ -366,19 +599,15 @@ async function getRealDirectorySize(dirPath) {
             if (stats.isFile()) {
               totalSize += stats.size;
             } else if (stats.isDirectory()) {
-              // Don't add directory size itself, just traverse it
               await calculateSize(fullPath);
             } else if (stats.isSymbolicLink()) {
-              // Skip symlinks to avoid double counting
               continue;
             }
           } catch (error) {
-            // Skip files/directories that can't be accessed
             continue;
           }
         }
       } catch (error) {
-        // Skip directories that can't be read
         return;
       }
     }
@@ -386,7 +615,6 @@ async function getRealDirectorySize(dirPath) {
     await calculateSize(dirPath);
     return totalSize;
   } catch (error) {
-    // If all else fails, return 0
     return 0;
   }
 }
@@ -437,15 +665,12 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
     const relativePath = path.relative(process.cwd(), filePath);
     const pathParts = relativePath.split(path.sep);
     
-    // Track if this path contains .git
     const hasGit = pathParts.includes('.git');
     if (hasGit) {
       this.gitSize += stats.size;
-      // Skip further processing for .git files - don't categorize them
       return;
     }
     
-    // Check if path should be ignored for code analysis
     let shouldIgnoreForCode = false;
     for (const part of pathParts) {
       if (this.ignoreDirs.has(part)) {
@@ -459,7 +684,6 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
   
     this.totalSize += stats.size;
     
-    // Skip further processing if ignored for code analysis
     if (shouldIgnoreForCode) {
       return;
     }
@@ -474,7 +698,6 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
         this.binarySize += stats.size;
       }
       else {
-        // Check if it's a code file using the centralized language detection
         const language = detectFileLanguage(filename);
         if (language) {
           this.codeSize += stats.size;
@@ -492,15 +715,12 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
   }
 
   getReport() {
-    // Other is what's left after subtracting all categorized sizes
     const otherSize = this.totalSize - this.codeSize - this.binarySize - this.archiveSize;
     
-    // FIXED: Code Purity Rate = (Pure Code / Analyzed Size) * 100
     const codePurityRate = this.totalSize > 0 
       ? ((this.codeSize / this.totalSize) * 100).toFixed(2)
       : '0.00';
     
-    // Calculate Repository Efficiency Rate: (analyzed size / real total size) * 100
     const repositoryEfficiencyRate = this.realTotalSize > 0 
       ? ((this.totalSize / this.realTotalSize) * 100).toFixed(2)
       : '100.00';
@@ -570,15 +790,13 @@ class PackageJsonAnalyzer extends BaseAnalyzer {
 
   async processFile(filePath, stats) {
     const relativePath = path.relative(process.cwd(), filePath);
-  const pathParts = relativePath.split(path.sep);
-  
-  // Skip .git and ignored directories completely
-  if (pathParts.includes('.git')) return;
-  for (const part of pathParts) {
-    if (IGNORE_DIRS.has(part)) return;
-  }
-  
-
+    const pathParts = relativePath.split(path.sep);
+    
+    if (pathParts.includes('.git')) return;
+    for (const part of pathParts) {
+      if (IGNORE_DIRS.has(part)) return;
+    }
+    
     if (path.basename(filePath) === 'package.json') {
       this.packageJsonFiles.push(filePath);
       
@@ -617,7 +835,6 @@ class PackageJsonAnalyzer extends BaseAnalyzer {
   getReport() {
     const totalFiles = this.packageJsonFiles.length;
     const pureProjects = totalFiles - this.projectsWithDeps;
-    // FIXED: When no package.json files exist, purity should be 100%
     const purityPercentage = totalFiles > 0 
       ? (pureProjects / totalFiles * 100).toFixed(2) 
       : '100.00';
@@ -645,7 +862,6 @@ class PackageJsonAnalyzer extends BaseAnalyzer {
 
 /**
  * Analyzer for counting lines of code by language
- * FIXED: Now correctly handles multi-dot extensions like file-12-one-example.ts
  */
 class LocAnalyzer extends BaseAnalyzer {
   constructor() {
@@ -661,7 +877,6 @@ class LocAnalyzer extends BaseAnalyzer {
     const relativePath = path.relative(process.cwd(), filePath);
     const pathParts = relativePath.split(path.sep);
     
-    // Skip .git and ignored directories completely
     if (pathParts.includes('.git')) return;
     for (const part of pathParts) {
       if (IGNORE_DIRS.has(part)) return;
@@ -670,7 +885,6 @@ class LocAnalyzer extends BaseAnalyzer {
     if (isArchiveFile(filename)) return;
     if (await isBinaryFile(filePath, stats)) return;
     
-    // Detect language using the centralized function
     const language = detectFileLanguage(filename);
     
     if (language) {
@@ -729,7 +943,6 @@ class ArchiveAnalyzer extends BaseAnalyzer {
     const relativePath = path.relative(process.cwd(), filePath);
     const pathParts = relativePath.split(path.sep);
     
-    // Skip .git and ignored directories completely
     if (pathParts.includes('.git')) return;
     for (const part of pathParts) {
       if (IGNORE_DIRS.has(part)) return;
@@ -788,12 +1001,10 @@ class BinaryAnalyzer extends BaseAnalyzer {
     const relativePath = path.relative(process.cwd(), filePath);
     const pathParts = relativePath.split(path.sep);
     
-    // Skip .git directory completely
     if (pathParts.includes('.git')) {
       return;
     }
     
-    // Skip ignored directories
     for (const part of pathParts) {
       if (IGNORE_DIRS.has(part)) {
         return;
@@ -842,6 +1053,7 @@ class BinaryAnalyzer extends BaseAnalyzer {
 
 /**
  * Analyzer for Git repositories to get contributors and commits
+ * FIX: Now handles similar emails and excludes generic emails
  */
 class GitAnalyzer extends BaseAnalyzer {
   constructor() {
@@ -896,33 +1108,34 @@ class GitAnalyzer extends BaseAnalyzer {
       });
       const totalCommits = parseInt(commitCountOutput.trim(), 10) || 0;
       
-      const { stdout: contributorsOutput } = await execPromise('git log --format="%ae" | sort -u | wc -l', {
-        cwd: repoPath,
-        shell: true,
-        encoding: 'utf8'
-      });
-      const uniqueContributors = parseInt(contributorsOutput.trim(), 10) || 0;
-      
-      const { stdout: contributorDetailsOutput } = await execPromise('git log --format="%an|%ae" | sort -u', {
+      const { stdout: contributorDetailsOutput } = await execPromise('git log --format="%an|%ae"', {
         cwd: repoPath,
         shell: true,
         encoding: 'utf8'
       });
       
-      const contributors = contributorDetailsOutput
+      // Parse all contributors (including duplicates)
+      const allContributors = contributorDetailsOutput
         .split('\n')
         .filter(line => line.trim() && line.includes('|'))
         .map(line => {
           const [name, email] = line.split('|');
-          return { name: name.trim(), email: email.trim() };
+          return { 
+            name: name.trim(), 
+            email: email.trim().toLowerCase() 
+          };
         });
+      
+      // Deduplicate contributors, excluding generic emails
+      const deduplicatedContributors = deduplicateContributors(allContributors);
+      const uniqueContributors = deduplicatedContributors.length;
       
       return {
         path: repoPath,
         name: path.basename(repoPath),
         totalCommits,
         uniqueContributors,
-        contributors,
+        contributors: deduplicatedContributors,
         success: true
       };
     } catch (error) {
@@ -1371,7 +1584,6 @@ async function processSingleDirectory(targetDir) {
   analyzer.resetAll();
   await analyzer.traverseDirectory(absolutePath);
   
-  // Calculate real total size
   await sizeAnalyzer.calculateRealSize(absolutePath);
   
   await gitAnalyzer.scanDirectory(absolutePath);
