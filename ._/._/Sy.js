@@ -67,7 +67,7 @@ class Sy extends SyAPP.Func() {
             await SyInstances.Model.update(props.edit_name, { Name: props.inputValue.trim() });
             setManageState({ action: null, confirmDeleteId: null });
           } else {
-            this.WaitInput(uid, { question: 'New name:', props: { edit_name: props.edit_name, page } });
+            this.WaitInput(uid, { question: 'New name:', props: { edit_name: props.edit_name, page: 'manage' } });
           }
         }
 
@@ -143,6 +143,28 @@ class Sy extends SyAPP.Func() {
           }
         };
 
+        // ---------- CLOSE ALL CHILD DROPDOWNS OF A PARENT ----------
+        const closeChildDropdowns = (parentId) => {
+          const descendants = [];
+          const collectDescendants = (id) => {
+            for (const inst of instances) {
+              if (inst.OwnerID === id) {
+                descendants.push(inst._id);
+                collectDescendants(inst._id);
+              }
+            }
+          };
+          collectDescendants(parentId);
+          for (const descId of descendants) {
+            const key = `dropdown-inst-${descId}`;
+            const state = this.Storages.Get(uid, key);
+            if (state && state.dropped) {
+              state.dropped = false;
+              this.Storages.Set(uid, key, state);
+            }
+          }
+        };
+
         // ---------- RENDER INSTANCE TREE (CLEAN) ----------
         const renderInstance = async (instance, depth = 0, isMain = false) => {
           const children = instances.filter(i => i.OwnerID === instance._id);
@@ -150,24 +172,31 @@ class Sy extends SyAPP.Func() {
           const count = children.length ? ` (${children.length})` : '';
           const prefix = isMain ? '🟢 ' : '    '.repeat(depth) + '└─ ';
 
-          // Check if this dropdown was clicked
+          // Capture state before DropDown for main close detection
+          const stateBefore = this.Storages.Get(uid, `dropdown-${key}`);
+          const wasOpenBefore = stateBefore?.dropped === true;
           const wasClicked = props.droprun === `dropdown-${key}`;
-          
-          // If this is a main instance and was clicked to open, close others
+
+          // If this is a main instance and was clicked to open, close other main dropdowns
           if (isMain && wasClicked) {
             const currentState = this.Storages.Get(uid, `dropdown-${key}`);
             if (currentState && !currentState.dropped) {
-              // It's about to open, close others
               closeOtherMainDropdowns(instance._id);
             }
           }
 
           await this.DropDown(uid, key, async () => {
-            // Only "Add Child" button inside each node
-            this.Button(uid, {
-              name: this.TextColor.orange('＋ Add Child'),
-              props: { new_instance: true, parent_id: instance._id, page }
-            });
+            // Group Add Child and Manage buttons horizontally
+            this.Buttons(uid, [
+              {
+                name: this.TextColor.orange('＋ Add Child'),
+                props: { new_instance: true, parent_id: instance._id, page }
+              },
+              {
+                name: this.TextColor.orange('⚙️ Manage'),
+                props: { page: 'manage' }
+              }
+            ]);
 
             // Recursively render children
             for (const child of children) {
@@ -178,27 +207,35 @@ class Sy extends SyAPP.Func() {
             down_buttontext: `${prefix}📂 ${instance.Name}${count}`,
             jumpTo: 0
           });
+
+          // After DropDown, check if main was open and now closed -> close children
+          const stateAfter = this.Storages.Get(uid, `dropdown-${key}`);
+          const isNowClosed = stateAfter?.dropped === false;
+          if (isMain && wasOpenBefore && isNowClosed) {
+            closeChildDropdowns(instance._id);
+          }
         };
 
-        // ---------- RENDER MAIN INSTANCES ----------
-        const mains = instances.filter(i => i.Main === true);
-        for (const main of mains) {
-          await renderInstance(main, 0, true);
-        }
+        // ---------- RENDER MAIN PAGE ----------
+        await this.Page(uid, '', async () => {
+          const mains = instances.filter(i => i.Main === true);
+          for (const main of mains) {
+            await renderInstance(main, 0, true);
+          }
 
-        // ---------- GLOBAL BUTTONS ----------
-        this.Button(uid, ' ');
-        
-        // Create New Main button
-        this.Button(uid, {
-          name: this.TextColor.orange('＋ New Main'),
-          props: { new_instance: true, page }
+          this.Button(uid, ' ');
+          this.Button(uid, {
+            name: this.TextColor.orange('＋ New Main'),
+            props: { new_instance: true, page }
+          });
+
+          this.Button(uid, ' ');
+          this.SideButton(uid, { name: '⚙️ Config', path: 'config' });
         });
 
-        // ---------- MANAGE DROPDOWN (HORIZONTAL, ON THE RIGHT SIDE) ----------
-        const manageState = getManageState();
-
-        await this.DropDown(uid, 'manage', async () => {
+        // ---------- RENDER MANAGE PAGE ----------
+        await this.Page(uid, 'manage', async () => {
+          const manageState = getManageState();
           const visible = getVisibleInstances(instances);
 
           // CONFIRMATION VIEW
@@ -207,8 +244,8 @@ class Sy extends SyAPP.Func() {
             const targetName = target ? target.Name : 'Unknown';
             this.Text(uid, `Delete "${targetName}"?`);
             this.Buttons(uid, [
-              { name: '✅ Yes, Delete', props: { do_delete: manageState.confirmDeleteId, page } },
-              { name: '❌ Cancel', props: { manage_action: 'back', page } }
+              { name: '✅ Yes, Delete', props: { do_delete: manageState.confirmDeleteId, page: 'manage' } },
+              { name: '❌ Cancel', props: { manage_action: 'back', page: 'manage' } }
             ]);
           }
           // EDIT NAME VIEW
@@ -220,15 +257,14 @@ class Sy extends SyAPP.Func() {
                 const indent = '　'.repeat(depth);
                 this.Button(uid, {
                   name: `${indent}${instance.Name}`,
-                  props: { edit_name: instance._id, page }
+                  props: { edit_name: instance._id, page: 'manage' }
                 });
               }
             }
-            // Back button to return to action selection
             this.Button(uid, ' ');
             this.Button(uid, {
               name: '↩ Back',
-              props: { manage_action: 'back', page }
+              props: { manage_action: 'back', page: 'manage' }
             });
           }
           // DELETE VIEW
@@ -240,34 +276,31 @@ class Sy extends SyAPP.Func() {
                 const indent = '　'.repeat(depth);
                 this.Button(uid, {
                   name: `${indent}${instance.Name}`,
-                  props: { confirm_delete: instance._id, page }
+                  props: { confirm_delete: instance._id, page: 'manage' }
                 });
               }
             }
-            // Back button to return to action selection
             this.Button(uid, ' ');
             this.Button(uid, {
               name: '↩ Back',
-              props: { manage_action: 'back', page }
+              props: { manage_action: 'back', page: 'manage' }
             });
           }
           // DEFAULT: ACTION SELECTION
           else {
             this.Buttons(uid, [
-              { name: '✏️ Edit Name', props: { manage_action: 'edit', page } },
-              { name: '🗑️ Delete', props: { manage_action: 'delete', page } }
+              { name: '✏️ Edit Name', props: { manage_action: 'edit', page: 'manage' } },
+              { name: '🗑️ Delete', props: { manage_action: 'delete', page: 'manage' } }
             ]);
           }
-        }, {
-          horizontal: true,
-          up_buttontext: '⚙️ Manage',
-          down_buttontext: '⚙️ Manage',
-          jumpTo: 0
-        });
 
-        // Keep the Config button
-        this.Button(uid, ' ');
-        this.SideButton(uid, { name: '⚙️ Config', path: 'config' });
+          // Back to main instances page
+          this.Button(uid, ' ');
+          this.Button(uid, {
+            name: '↩ Back to Instances',
+            props: { page: '' }
+          });
+        });
       },
       { linked: [Config] }
     );
