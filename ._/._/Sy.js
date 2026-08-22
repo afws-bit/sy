@@ -186,14 +186,17 @@ class Sy extends SyAPP.Func() {
           }
 
           await this.DropDown(uid, key, async () => {
-            // Group Add Child and Manage buttons horizontally
+            // Calculate indentation for buttons based on depth
+            const buttonIndent = '  '.repeat(depth + 1);
+            
+            // Group Add Child and Manage buttons horizontally with extra indentation
             this.Buttons(uid, [
               {
-                name: this.TextColor.orange('＋ Add Child'),
+                name: this.TextColor.orange(`${buttonIndent}＋ Add Child`),
                 props: { new_instance: true, parent_id: instance._id, page }
               },
               {
-                name: this.TextColor.orange('⚙️ Manage'),
+                name: this.TextColor.orange(`${buttonIndent}⚙️ Manage`),
                 props: { page: 'manage' }
               }
             ]);
