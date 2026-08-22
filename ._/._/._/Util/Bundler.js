@@ -1,4 +1,4 @@
-// bundle.js - FINAL VERSION WITH QEMU FIX
+// bundle.js - FINAL VERSION WITH COMPLETE CIRCULAR DEPENDENCY FIX + PRECISE STATIC PROPERTY MATCHING
 import { readFileSync, writeFileSync, statSync } from 'fs';
 import { resolve, dirname, extname, relative } from 'path';
 import { fileURLToPath } from 'url';
@@ -14,6 +14,7 @@ class ModuleBundler {
     this.moduleRegistry = new Map();
     this.moduleCounter = 0;
     this.debug = options.debug === true;
+    this.circularDependencies = new Set();
   }
 
   // --- Module type helpers ---
@@ -139,7 +140,8 @@ class ModuleBundler {
       hasDefault: false,
       defaultExpression: null,
     };
-    const defaultFuncMatch = content.match(/export\s+default\s+function\s+(\w+)/);
+    // Support `export default async function`
+    const defaultFuncMatch = content.match(/export\s+default\s+(?:async\s+)?function\s+(\w+)/);
     const defaultClassMatch = content.match(/export\s+default\s+class\s+(\w+)/);
     const defaultExprMatch = content.match(/export\s+default\s+([^;\n]+)/);
     if (defaultFuncMatch) {
@@ -157,7 +159,8 @@ class ModuleBundler {
         exports.defaultExport = expr;
       }
     }
-    const namedRegex = /export\s+(?:const|let|var|function|class)\s+(\w+)/g;
+    // Include `async function` in named export matching
+    const namedRegex = /export\s+(?:const|let|var|class|async\s+function|function)\s+(\w+)/g;
     let match;
     while ((match = namedRegex.exec(content)) !== null) {
       exports.namedExports.add(match[1]);
@@ -177,6 +180,11 @@ class ModuleBundler {
       cleaned = cleaned.slice(0, imp.position) + cleaned.slice(imp.endPosition);
     }
     cleaned = cleaned.replace(/^#!.*\n/, '');
+    // Strip `export default async function` before the generic default function regex
+    cleaned = cleaned.replace(/export\s+default\s+async\s+function\s+(\w+)/g, 'async function $1');
+    // Strip `export async function` before the generic export regex
+    cleaned = cleaned.replace(/export\s+async\s+function\s+(\w+)/g, 'async function $1');
+    // Existing default and named export stripping (unchanged)
     cleaned = cleaned.replace(/export\s+default\s+function\s+(\w+)/g, 'function $1');
     cleaned = cleaned.replace(/export\s+default\s+class\s+(\w+)/g, 'class $1');
     cleaned = cleaned.replace(/export\s+default\s+/g, 'var _defaultExport = ');
@@ -273,72 +281,61 @@ class ModuleBundler {
     let replaced = false;
     let matchCount = 0;
 
-    // ALL patterns to catch (order matters for overlapping patterns)
     const patterns = [
-      // Pattern 1: process.argv[1] === fileURLToPath(import.meta.url) - QEMU's pattern
       {
         regex: /if\s*\(\s*process\.argv\[1\]\s*===?\s*fileURLToPath\(import\.meta\.url\)\s*\)\s*\{/g,
         replacement: (match) => isEntry 
           ? `if (true) { // was: ${match.trim()}`
           : `if (false) { // was: ${match.trim()}`
       },
-      // Pattern 2: fileURLToPath(import.meta.url) === process.argv[1] - reversed
       {
         regex: /if\s*\(\s*fileURLToPath\(import\.meta\.url\)\s*===?\s*process\.argv\[1\]\s*\)\s*\{/g,
         replacement: (match) => isEntry 
           ? `if (true) { // was: ${match.trim()}`
           : `if (false) { // was: ${match.trim()}`
       },
-      // Pattern 3: process.argv[1] === __filename
       {
         regex: /if\s*\(\s*process\.argv\[1\]\s*===?\s*__filename\s*\)\s*\{/g,
         replacement: (match) => isEntry 
           ? `if (true) { // was: ${match.trim()}`
           : `if (false) { // was: ${match.trim()}`
       },
-      // Pattern 4: __filename === process.argv[1]
       {
         regex: /if\s*\(\s*__filename\s*===?\s*process\.argv\[1\]\s*\)\s*\{/g,
         replacement: (match) => isEntry 
           ? `if (true) { // was: ${match.trim()}`
           : `if (false) { // was: ${match.trim()}`
       },
-      // Pattern 5: require.main === module
       {
         regex: /if\s*\(\s*require\.main\s*===?\s*module\s*\)\s*\{/g,
         replacement: (match) => isEntry 
           ? `if (true) { // was: ${match.trim()}`
           : `if (false) { // was: ${match.trim()}`
       },
-      // Pattern 6: module === require.main
       {
         regex: /if\s*\(\s*module\s*===?\s*require\.main\s*\)\s*\{/g,
         replacement: (match) => isEntry 
           ? `if (true) { // was: ${match.trim()}`
           : `if (false) { // was: ${match.trim()}`
       },
-      // Pattern 7: import.meta.url === `file://${process.argv[1]}`
       {
         regex: /if\s*\(\s*import\.meta\.url\s*===?\s*`file:\/\/\$\{process\.argv\[1\]\}`\s*\)\s*\{/g,
         replacement: (match) => isEntry 
           ? `if (true) { // was: ${match.trim()}`
           : `if (false) { // was: ${match.trim()}`
       },
-      // Pattern 8: import.meta.url === process.argv[1] (direct comparison)
       {
         regex: /if\s*\(\s*import\.meta\.url\s*===?\s*process\.argv\[1\]\s*\)\s*\{/g,
         replacement: (match) => isEntry 
           ? `if (true) { // was: ${match.trim()}`
           : `if (false) { // was: ${match.trim()}`
       },
-      // Pattern 9: !module.parent
       {
         regex: /if\s*\(\s*\!\s*module\.parent\s*\)\s*\{/g,
         replacement: (match) => isEntry 
           ? `if (true) { // was: ${match.trim()}`
           : `if (false) { // was: ${match.trim()}`
       },
-      // Pattern 10: module.parent === null
       {
         regex: /if\s*\(\s*module\.parent\s*===?\s*null\s*\)\s*\{/g,
         replacement: (match) => isEntry 
@@ -371,6 +368,205 @@ class ModuleBundler {
     }
     
     return transformed;
+  }
+
+  /**
+   * Transform circular dependencies through lazy loading.
+   * This is the main entry point for handling circular dependency issues.
+   */
+  transformCircularDependencies(content, imports, currentFilePath) {
+    // Build a map of imported identifiers to their source module info
+    const importInfoMap = new Map();
+    
+    for (const imp of imports) {
+      if (imp.isNative) continue;
+
+      const depPath = this.resolveModulePath(imp.modulePath, currentFilePath);
+      const depModule = this.moduleRegistry.get(depPath);
+      if (!depModule || depModule.isNative) continue;
+
+      // Check if this is a circular dependency
+      const isCircular = this.isCircularDependency(currentFilePath, depPath);
+      
+      const depId = depModule.id;
+
+      // Default import
+      if (imp.defaultImport) {
+        importInfoMap.set(imp.defaultImport, {
+          depId,
+          accessor: 'default',
+          type: 'default',
+          isCircular
+        });
+      }
+
+      // Named imports (including those from combined imports)
+      if (imp.namedImports && imp.namedImports.length > 0) {
+        for (const named of imp.namedImports) {
+          const localName = named.alias || named.original;
+          importInfoMap.set(localName, {
+            depId,
+            accessor: named.original,
+            type: 'named',
+            isCircular
+          });
+        }
+      }
+
+      // Namespace import
+      if (imp.namespaceImport) {
+        importInfoMap.set(imp.namespaceImport, {
+          depId,
+          accessor: null,
+          type: 'namespace',
+          isCircular
+        });
+      }
+    }
+
+    // Transform static property assignments
+    content = this.transformStaticProperties(content, importInfoMap);
+    
+    // Transform constructor references in circular dependencies
+    content = this.transformConstructorReferences(content, importInfoMap);
+
+    return content;
+  }
+
+  /**
+   * Transform static property assignments that reference imported modules
+   * into lazy getters to break circular dependencies.
+   * FIXED: More precise regex to avoid matching method calls
+   */
+  transformStaticProperties(content, importInfoMap) {
+    // More precise regex: matches only simple static assignments, not method calls
+    // Pattern: static PropertyName = Identifier; (with optional semicolon)
+    // Uses negative lookahead to avoid matching when followed by . or (
+    const staticAssignRegex = /static\s+(\w+)\s*=\s*([A-Za-z_$][\w$]*)\s*(?=[;\n]|$)/g;
+    const replacements = [];
+    let match;
+
+    while ((match = staticAssignRegex.exec(content)) !== null) {
+      const [full, propName, importedIdent] = match;
+      const info = importInfoMap.get(importedIdent);
+      if (!info) continue;
+
+      // Double-check: ensure this is really a static property assignment
+      // and not part of a larger expression
+      const beforeMatch = content.slice(Math.max(0, match.index - 20), match.index);
+      const afterMatch = content.slice(match.index + full.length, match.index + full.length + 20);
+      
+      // Skip if this appears to be part of a method chain or call
+      if (afterMatch.trimStart().startsWith('.') || afterMatch.trimStart().startsWith('(')) {
+        continue;
+      }
+
+      let requireExpr;
+      if (info.type === 'namespace') {
+        requireExpr = `__require('${info.depId}')`;
+      } else if (info.type === 'default') {
+        requireExpr = `__require('${info.depId}').default`;
+      } else { // named
+        requireExpr = `__require('${info.depId}').${info.accessor}`;
+      }
+
+      const getter = `static get ${propName}() { return ${requireExpr}; }`;
+
+      replacements.push({
+        start: match.index,
+        end: match.index + full.length,
+        replacement: getter,
+        propName,
+        importedIdent
+      });
+
+      if (this.debug) {
+        const lineNum = content.slice(0, match.index).split('\n').length;
+        console.log(`     🔄 Static property: ${propName} = ${importedIdent} → lazy getter (line ${lineNum})`);
+      }
+    }
+
+    if (replacements.length === 0) return content;
+
+    // Apply replacements from end to start to avoid shifting indices
+    let result = content;
+    for (const replacement of replacements.sort((a, b) => b.start - a.start)) {
+      result = result.slice(0, replacement.start) + replacement.replacement + result.slice(replacement.end);
+    }
+
+    return result;
+  }
+
+  /**
+   * Transform constructor references in circular dependencies
+   * to use lazy loading.
+   */
+  transformConstructorReferences(content, importInfoMap) {
+    // Find patterns like: new EasyAI(...) where EasyAI is a circular import
+    const constructorRegex = /new\s+([A-Za-z_$][\w$]*)\s*\(/g;
+    const replacements = [];
+    let match;
+
+    while ((match = constructorRegex.exec(content)) !== null) {
+      const [full, constructorName] = match;
+      const info = importInfoMap.get(constructorName);
+      
+      // Only transform if this is a circular dependency
+      if (!info || !info.isCircular) continue;
+
+      let requireExpr;
+      if (info.type === 'default') {
+        requireExpr = `__require('${info.depId}').default`;
+      } else if (info.type === 'named') {
+        requireExpr = `__require('${info.depId}').${info.accessor}`;
+      } else {
+        continue; // Skip namespace imports for constructor references
+      }
+
+      const lazyConstructor = `new (${requireExpr})(`;
+
+      replacements.push({
+        start: match.index,
+        end: match.index + full.length,
+        replacement: lazyConstructor,
+        constructorName
+      });
+
+      if (this.debug) {
+        const lineNum = content.slice(0, match.index).split('\n').length;
+        console.log(`     🔄 Constructor: new ${constructorName}(...) → lazy loading (line ${lineNum})`);
+      }
+    }
+
+    if (replacements.length === 0) return content;
+
+    // Apply replacements from end to start to avoid shifting indices
+    let result = content;
+    for (const replacement of replacements.sort((a, b) => b.start - a.start)) {
+      result = result.slice(0, replacement.start) + replacement.replacement + result.slice(replacement.end);
+    }
+
+    return result;
+  }
+
+  /**
+   * Detect if two modules have a circular dependency.
+   */
+  isCircularDependency(moduleA, moduleB) {
+    // Simple check: if moduleA imports moduleB and moduleB imports moduleA
+    const moduleAInfo = this.moduleRegistry.get(moduleA);
+    const moduleBInfo = this.moduleRegistry.get(moduleB);
+    
+    if (!moduleAInfo || !moduleBInfo) return false;
+    
+    // Check if B imports A
+    const bImportsA = moduleBInfo.imports.some(imp => {
+      if (imp.isNative) return false;
+      const resolvedPath = this.resolveModulePath(imp.modulePath, moduleB);
+      return resolvedPath === moduleA;
+    });
+    
+    return bImportsA;
   }
 
   // --- Main processing ---
@@ -431,13 +627,17 @@ class ModuleBundler {
         }
       }
 
-      // Process dependencies
+      // Process dependencies first (so their module IDs are known)
       for (const imp of imports) {
         if (!imp.isNative) {
           const resolvedPath = this.resolveModulePath(imp.modulePath, filePath);
           this.processModule(resolvedPath);
         }
       }
+
+      // Now that dependencies are registered, transform circular dependencies
+      cleanedContent = this.transformCircularDependencies(cleanedContent, imports, filePath);
+      moduleInfo.content = cleanedContent;
 
       return moduleInfo;
     } catch (error) {
@@ -446,7 +646,7 @@ class ModuleBundler {
     }
   }
 
-  // --- Bundle generation (unchanged) ---
+  // --- Bundle generation (with circular dependency fix) ---
   generateBundle() {
     let output = '';
     const modules = Array.from(this.processedModules.values());
@@ -470,12 +670,15 @@ class ModuleBundler {
     output += "const __nativeRequire = createRequire(import.meta.url);\n\n";
     output += 'const __modules = {};\n';
     output += 'const __moduleCache = {};\n';
+    output += 'const __moduleExports = {};\n';
     output += 'function __require(id) {\n';
-    output += '  if (__moduleCache[id]) return __moduleCache[id];\n';
+    output += '  if (__moduleCache[id]) return __moduleExports[id];\n';
     output += '  if (!__modules[id]) throw new Error(`Module ${id} not found`);\n';
-    output += '  const exports = __modules[id]();\n';
-    output += '  __moduleCache[id] = exports;\n';
-    output += '  return exports;\n';
+    output += '  __moduleCache[id] = true;\n';
+    output += '  __moduleExports[id] = {};\n';
+    output += '  const exports = __modules[id](__moduleExports[id]);\n';
+    output += '  __moduleExports[id] = exports || __moduleExports[id];\n';
+    output += '  return __moduleExports[id];\n';
     output += '}\n\n';
 
     for (const module of modules) {
@@ -491,8 +694,8 @@ class ModuleBundler {
         output += '\n';
       }
 
-      output += `__modules['${module.id}'] = function() {\n`;
-      output += `  var exports = {};\n`;
+      output += `__modules['${module.id}'] = function(exports) {\n`;
+      output += `  exports = exports || {};\n`;
       output += `  var module = { exports: exports };\n\n`;
 
       for (const imp of module.imports) {
@@ -521,22 +724,50 @@ class ModuleBundler {
           const depPath = this.resolveModulePath(imp.modulePath, module.path);
           const depModule = this.moduleRegistry.get(depPath);
           if (depModule && !depModule.isNative) {
+            // Check if this is a circular dependency
+            const isCircular = this.isCircularDependency(module.path, depPath);
+            
             if (imp.type === 'default') {
-              output += `  var ${imp.defaultImport} = __require('${depModule.id}').default;\n`;
+              if (isCircular) {
+                // For circular dependencies, use lazy loading with Proxy
+                output += `  var ${imp.defaultImport} = new Proxy({}, { get: (_, prop) => { const mod = __require('${depModule.id}'); return prop === 'default' ? mod.default : mod[prop]; } });\n`;
+              } else {
+                output += `  var ${imp.defaultImport} = __require('${depModule.id}').default;\n`;
+              }
             } else if (imp.type === 'named') {
               const names = imp.namedImports.map(n =>
                 n.original !== n.alias ? `${n.original}: ${n.alias}` : n.original
               ).join(', ');
-              output += `  var { ${names} } = __require('${depModule.id}');\n`;
+              if (isCircular) {
+                // For circular dependencies, use lazy loading for each named import
+                for (const named of imp.namedImports) {
+                  const localName = named.alias || named.original;
+                  output += `  var ${localName} = undefined; Object.defineProperty(this, '${localName}', { get: () => __require('${depModule.id}').${named.original} });\n`;
+                }
+              } else {
+                output += `  var { ${names} } = __require('${depModule.id}');\n`;
+              }
             } else if (imp.type === 'namespace') {
-              output += `  var ${imp.namespaceImport} = __require('${depModule.id}');\n`;
+              if (isCircular) {
+                output += `  var ${imp.namespaceImport} = new Proxy({}, { get: (_, prop) => __require('${depModule.id}')[prop] });\n`;
+              } else {
+                output += `  var ${imp.namespaceImport} = __require('${depModule.id}');\n`;
+              }
             } else if (imp.type === 'combined') {
-              output += `  var ${imp.defaultImport} = __require('${depModule.id}').default;\n`;
-              const namedNames = imp.namedImports.map(n =>
-                n.original !== n.alias ? `${n.original}: ${n.alias}` : n.original
-              ).join(', ');
-              if (namedNames) {
-                output += `  var { ${namedNames} } = __require('${depModule.id}');\n`;
+              if (isCircular) {
+                output += `  var ${imp.defaultImport} = new Proxy({}, { get: (_, prop) => { const mod = __require('${depModule.id}'); return prop === 'default' ? mod.default : mod[prop]; } });\n`;
+                for (const named of imp.namedImports) {
+                  const localName = named.alias || named.original;
+                  output += `  var ${localName} = undefined; Object.defineProperty(this, '${localName}', { get: () => __require('${depModule.id}').${named.original} });\n`;
+                }
+              } else {
+                output += `  var ${imp.defaultImport} = __require('${depModule.id}').default;\n`;
+                const namedNames = imp.namedImports.map(n =>
+                  n.original !== n.alias ? `${n.original}: ${n.alias}` : n.original
+                ).join(', ');
+                if (namedNames) {
+                  output += `  var { ${namedNames} } = __require('${depModule.id}');\n`;
+                }
               }
             }
           }
@@ -626,7 +857,6 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
   let debug = false;
   let entryFile, outputFile;
 
-  // Parse --debug flag
   const filteredArgs = args.filter(arg => {
     if (arg === '--debug') {
       debug = true;
