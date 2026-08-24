@@ -2,8 +2,7 @@
 
 /**
  * GitView - Comprehensive Git Repository Visualization and Analysis Tool
- * Enhanced with Pack.js integration, grouping, and comparison features
- * Group management available through web interface
+ * Enhanced with complete Pack.js integration, grouping, and comparison features
  */
 
 import { spawnSync, spawn } from 'child_process';
@@ -164,7 +163,8 @@ class ArgumentParser {
             dir: false,
             group: null,
             createGroup: null,
-            addToGroup: null
+            addToGroup: null,
+            compareWith: null
         };
         this.parse();
     }
@@ -208,6 +208,12 @@ class ArgumentParser {
                         i++;
                     }
                     break;
+                case '--compare-with':
+                    if (i + 1 < args.length) {
+                        this.args.compareWith = args[i + 1];
+                        i++;
+                    }
+                    break;
                 case '--create-group':
                     if (i + 1 < args.length) {
                         this.args.createGroup = args[i + 1];
@@ -245,6 +251,7 @@ OPTIONS:
     --repo, -r <path>       Specify repository path
     --dir                   Analyze all repositories inside a directory
     --group, -g <name>      Load a specific group of repositories
+    --compare-with <name>   Compare with another group or repo
     --create-group <name>   Create a new group (requires --dir or --repo)
     --add-to-group <name>   Add current repos to existing group
 
@@ -254,6 +261,7 @@ EXAMPLES:
     node gitview.js --port 3000        # Start server on port 3000
     node gitview.js --dir /path/to/repos   # Analyze all repos in directory
     node gitview.js --group my-group   # Load a saved group
+    node gitview.js --compare-with other-group --group my-group
     node gitview.js --create-group team-repos --dir /path/to/repos
         `);
     }
@@ -714,6 +722,220 @@ class GitView {
 }
 
 // ============================================================================
+// GROUP ANALYSIS - Aggregates data from multiple repos
+// ============================================================================
+
+class GroupAnalyzer {
+    static analyzeGroup(repoDataList) {
+        const validRepos = repoDataList.filter(r => r && r.data);
+        if (validRepos.length === 0) return null;
+
+        const aggregatedData = {
+            repository: {
+                name: `Group (${validRepos.length} repos)`,
+                path: 'GROUP',
+                gitDir: 'GROUP',
+                remoteUrl: 'GROUP',
+                defaultBranch: 'GROUP',
+                currentBranch: 'GROUP',
+                currentCommit: 'GROUP',
+                isBare: false,
+                isShallow: false,
+                gitVersion: 'GROUP',
+                description: `Aggregated data from ${validRepos.length} repositories`
+            },
+            branches: [],
+            tags: [],
+            commits: [],
+            authors: [],
+            commitsByMonth: {},
+            yearlySummary: {},
+            fileStats: [],
+            health: {
+                totalCommits: 0,
+                totalBranches: 0,
+                totalTags: 0,
+                totalFiles: 0,
+                repoSize: '0 B',
+                contributors: 0,
+                lastActivity: null,
+                firstCommit: null,
+                daysActive: 0
+            },
+            packAnalysis: null
+        };
+
+        // Aggregate basic stats
+        for (const repo of validRepos) {
+            aggregatedData.health.totalCommits += repo.data.health.totalCommits;
+            aggregatedData.health.totalBranches += repo.data.health.totalBranches;
+            aggregatedData.health.totalTags += repo.data.health.totalTags;
+            aggregatedData.health.totalFiles += repo.data.health.totalFiles;
+            
+            if (!aggregatedData.health.lastActivity || 
+                (repo.data.health.lastActivity && repo.data.health.lastActivity > aggregatedData.health.lastActivity)) {
+                aggregatedData.health.lastActivity = repo.data.health.lastActivity;
+            }
+            
+            if (!aggregatedData.health.firstCommit || 
+                (repo.data.health.firstCommit && repo.data.health.firstCommit < aggregatedData.health.firstCommit)) {
+                aggregatedData.health.firstCommit = repo.data.health.firstCommit;
+            }
+            
+            // Aggregate branches
+            aggregatedData.branches.push(...repo.data.branches.map(b => ({
+                ...b,
+                repoName: repo.name
+            })));
+            
+            // Aggregate tags
+            aggregatedData.tags.push(...repo.data.tags.map(t => ({
+                ...t,
+                repoName: repo.name
+            })));
+            
+            // Aggregate commits
+            aggregatedData.commits.push(...repo.data.commits.map(c => ({
+                ...c,
+                repoName: repo.name
+            })));
+        }
+
+        // Calculate days active
+        if (aggregatedData.health.firstCommit && aggregatedData.health.lastActivity) {
+            const first = new Date(aggregatedData.health.firstCommit);
+            const last = new Date(aggregatedData.health.lastActivity);
+            aggregatedData.health.daysActive = Math.ceil((last - first) / (1000 * 60 * 60 * 24));
+        }
+
+        // Aggregate authors with deduplication
+        const authorMap = new Map();
+        for (const repo of validRepos) {
+            for (const author of repo.data.authors) {
+                const key = author.email.toLowerCase();
+                if (!authorMap.has(key)) {
+                    authorMap.set(key, {
+                        ...author,
+                        repos: [repo.name]
+                    });
+                } else {
+                    const existing = authorMap.get(key);
+                    existing.commits += author.commits;
+                    existing.insertions += author.insertions;
+                    existing.deletions += author.deletions;
+                    existing.repos.push(repo.name);
+                    
+                    if (author.firstCommit && (!existing.firstCommit || author.firstCommit < existing.firstCommit)) {
+                        existing.firstCommit = author.firstCommit;
+                    }
+                    if (author.lastCommit && (!existing.lastCommit || author.lastCommit > existing.lastCommit)) {
+                        existing.lastCommit = author.lastCommit;
+                    }
+                }
+            }
+        }
+        aggregatedData.authors = Array.from(authorMap.values());
+        aggregatedData.health.contributors = aggregatedData.authors.length;
+
+        // Aggregate monthly data
+        for (const repo of validRepos) {
+            for (const [key, data] of Object.entries(repo.data.commitsByMonth)) {
+                if (!aggregatedData.commitsByMonth[key]) {
+                    aggregatedData.commitsByMonth[key] = {
+                        year: data.year,
+                        month: data.month,
+                        commits: [],
+                        commitCount: 0,
+                        insertions: 0,
+                        deletions: 0,
+                        authors: new Set()
+                    };
+                }
+                
+                aggregatedData.commitsByMonth[key].commitCount += data.commitCount;
+                aggregatedData.commitsByMonth[key].insertions += data.insertions;
+                aggregatedData.commitsByMonth[key].deletions += data.deletions;
+                aggregatedData.commitsByMonth[key].commits.push(...data.commits);
+                
+                data.authors.forEach(a => aggregatedData.commitsByMonth[key].authors.add(a));
+            }
+        }
+
+        // Convert Sets to arrays for monthly data
+        for (const key in aggregatedData.commitsByMonth) {
+            aggregatedData.commitsByMonth[key].authors = Array.from(aggregatedData.commitsByMonth[key].authors);
+            aggregatedData.commitsByMonth[key].authorsCount = aggregatedData.commitsByMonth[key].authors.length;
+        }
+
+        // Aggregate yearly data
+        for (const repo of validRepos) {
+            for (const [year, data] of Object.entries(repo.data.yearlySummary)) {
+                if (!aggregatedData.yearlySummary[year]) {
+                    aggregatedData.yearlySummary[year] = {
+                        year: parseInt(year),
+                        commitCount: 0,
+                        insertions: 0,
+                        deletions: 0,
+                        authors: new Set(),
+                        months: {}
+                    };
+                }
+                
+                aggregatedData.yearlySummary[year].commitCount += data.commitCount;
+                aggregatedData.yearlySummary[year].insertions += data.insertions;
+                aggregatedData.yearlySummary[year].deletions += data.deletions;
+                
+                data.authors.forEach(a => aggregatedData.yearlySummary[year].authors.add(a));
+                
+                for (const [monthKey, monthData] of Object.entries(data.months)) {
+                    if (!aggregatedData.yearlySummary[year].months[monthKey]) {
+                        aggregatedData.yearlySummary[year].months[monthKey] = monthData;
+                    }
+                }
+            }
+        }
+
+        // Convert Sets to arrays for yearly data
+        for (const year in aggregatedData.yearlySummary) {
+            aggregatedData.yearlySummary[year].authors = Array.from(aggregatedData.yearlySummary[year].authors);
+            aggregatedData.yearlySummary[year].authorsCount = aggregatedData.yearlySummary[year].authors.length;
+        }
+
+        // Sort commits by date
+        aggregatedData.commits.sort((a, b) => new Date(b.authorDate) - new Date(a.authorDate));
+        aggregatedData.commits = aggregatedData.commits.slice(0, 500);
+
+        // Aggregate Pack.js data
+        const packInputs = validRepos.map(r => r.path);
+        if (packInputs.length > 0) {
+            // We'll analyze this async in the caller
+        }
+
+        return aggregatedData;
+    }
+
+    static async analyzeGroupWithPack(repoDataList) {
+        const aggregatedData = this.analyzeGroup(repoDataList);
+        if (!aggregatedData) return null;
+
+        const validRepos = repoDataList.filter(r => r && r.data);
+        const packInputs = validRepos.map(r => r.path);
+        
+        if (packInputs.length > 0) {
+            try {
+                const packResult = await analyzeDirectories(packInputs);
+                aggregatedData.packAnalysis = packResult.report || packResult;
+            } catch (error) {
+                console.error(`Pack analysis failed for group: ${error.message}`);
+                aggregatedData.packAnalysis = null;
+            }
+        }
+
+        return aggregatedData;
+    }
+}
+
+// ============================================================================
 // LOADING PAGE GENERATOR
 // ============================================================================
 
@@ -1014,12 +1236,12 @@ class LoadingPageGenerator {
 }
 
 // ============================================================================
-// HTML TEMPLATE GENERATOR
+// HTML TEMPLATE GENERATOR - With Complete Pack.js Data
 // ============================================================================
 
 class HTMLGenerator {
     static generateHTML(data, options = {}) {
-        const { repoList = [], currentIndex = 0, groups = [], currentGroup = null } = options;
+        const { repoList = [], currentIndex = 0, groups = [], currentGroup = null, comparisonTargets = [] } = options;
         const hasMultiple = repoList.length > 1;
         const hasGroups = groups.length > 0;
         const monthlyData = data.commitsByMonth;
@@ -1031,6 +1253,14 @@ class HTMLGenerator {
 
         const maxMonthlyCommits = Math.max(...monthlyKeys.map(key => monthlyData[key].commitCount), 1);
         const maxYearlyCommits = Math.max(...yearlyKeys.map(key => yearlyData[key].commitCount), 1);
+
+        // Extract Pack.js data
+        const packSizeData = packData?.['Total Size Analyzer'] || {};
+        const packLocData = packData?.['Lines of Code Analyzer'] || {};
+        const packArchiveData = packData?.['Archive Files Analyzer'] || {};
+        const packBinaryData = packData?.['Binary Files Analyzer'] || {};
+        const packPkgData = packData?.['Package.json Analyzer'] || {};
+        const packGitData = packData?.['Git Analyzer'] || {};
 
         return `
 <!DOCTYPE html>
@@ -1101,6 +1331,7 @@ class HTMLGenerator {
             border-radius: 6px;
             transition: all 0.3s;
             cursor: pointer;
+            background: var(--bg-secondary);
         }
 
         .nav-link:hover {
@@ -1160,7 +1391,7 @@ class HTMLGenerator {
 
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 15px;
             margin-bottom: 20px;
         }
@@ -1203,6 +1434,8 @@ class HTMLGenerator {
             justify-content: space-between;
             align-items: center;
             margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 10px;
         }
 
         .chart-title {
@@ -1249,6 +1482,7 @@ class HTMLGenerator {
             gap: 2px;
             padding: 10px;
             position: relative;
+            overflow-x: auto;
         }
 
         .chart-bar {
@@ -1375,6 +1609,12 @@ class HTMLGenerator {
             font-weight: bold;
         }
 
+        .author-email {
+            color: var(--text-secondary);
+            font-size: 11px;
+            margin-bottom: 8px;
+        }
+
         .author-stats {
             color: var(--text-secondary);
             font-size: 12px;
@@ -1498,6 +1738,12 @@ class HTMLGenerator {
             border-color: var(--danger);
         }
 
+        .btn-success {
+            background: var(--success);
+            color: var(--bg-primary);
+            border-color: var(--success);
+        }
+
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
@@ -1529,6 +1775,7 @@ class HTMLGenerator {
             ${hasMultiple ? `<a href="/compare" class="nav-link">🔍 Comparison</a>` : ''}
             <button class="nav-link" onclick="openGroupsModal()">📦 Groups</button>
             <button class="nav-link" onclick="openNewGroupModal()">➕ New Group</button>
+            ${comparisonTargets.length > 0 ? `<button class="nav-link" onclick="openCompareModal()">⚖️ Compare With</button>` : ''}
         </div>
 
         ${hasMultiple ? `
@@ -1599,33 +1846,69 @@ class HTMLGenerator {
 
         ${packData ? `
         <div class="pack-info fade-in">
-            <h2>📦 Package Analysis</h2>
+            <h2>📦 Complete Package Analysis (from Pack.js)</h2>
             <div class="pack-grid">
                 <div class="pack-item">
-                    <h4>💾 Real Total Size</h4>
-                    <p>${packData['Total Size Analyzer']?.realTotalSizeFormatted || 'N/A'}</p>
+                    <h4>💾 REAL Total Size</h4>
+                    <p>${packSizeData.realTotalSizeFormatted || 'N/A'} (${packSizeData.realTotalSizeMB || '0'} MB)</p>
                 </div>
                 <div class="pack-item">
-                    <h4>📝 Code Size</h4>
-                    <p>${packData['Total Size Analyzer']?.codeSizeFormatted || 'N/A'}</p>
+                    <h4>📁 Analyzed Size</h4>
+                    <p>${packSizeData.totalSizeFormatted || 'N/A'}</p>
                 </div>
                 <div class="pack-item">
-                    <h4>💎 Code Purity</h4>
-                    <p>${packData['Total Size Analyzer']?.codePurityRate || 'N/A'}</p>
+                    <h4>📝 Pure Code Size</h4>
+                    <p>${packSizeData.codeSizeFormatted || 'N/A'} (${packSizeData.codeSizeMB || '0'} MB)</p>
                 </div>
                 <div class="pack-item">
-                    <h4>📊 Total Lines</h4>
-                    <p>${packData['Lines of Code Analyzer']?.totalLinesFormatted || 'N/A'}</p>
+                    <h4>💾 Binary Files</h4>
+                    <p>${packSizeData.binarySizeFormatted || 'N/A'}</p>
                 </div>
                 <div class="pack-item">
-                    <h4>👥 Git Contributors</h4>
-                    <p>${packData['Git Analyzer']?.totalUniqueContributors || 'N/A'}</p>
+                    <h4>📦 Archive Files</h4>
+                    <p>${packSizeData.archiveSizeFormatted || 'N/A'}</p>
                 </div>
                 <div class="pack-item">
-                    <h4>🔀 Git Repos</h4>
-                    <p>${packData['Git Analyzer']?.totalRepositories || 'N/A'}</p>
+                    <h4>🔧 .git Directory</h4>
+                    <p>${packSizeData.gitSizeFormatted || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>💎 Code Purity Rate</h4>
+                    <p>${packSizeData.codePurityRate || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>⚡ Repository Efficiency</h4>
+                    <p>${packSizeData.repositoryEfficiencyRate || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>📊 Total Lines of Code</h4>
+                    <p>${packLocData.totalLinesFormatted || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>🔀 Git Contributors (Deduped)</h4>
+                    <p>${packGitData.totalUniqueContributors || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>📦 Git Repositories</h4>
+                    <p>${packGitData.totalRepositories || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>📝 Total Commits (Pack)</h4>
+                    <p>${packGitData.totalCommits || 'N/A'}</p>
                 </div>
             </div>
+            
+            ${packLocData.languages && packLocData.languages.length > 0 ? `
+            <h3 style="margin-top: 20px; color: var(--accent);">📊 Languages Breakdown</h3>
+            <div class="pack-grid" style="margin-top: 10px;">
+                ${packLocData.languages.slice(0, 10).map(lang => `
+                <div class="pack-item">
+                    <h4>${lang.language} (${lang.percentage}%)</h4>
+                    <p>${lang.lines.toLocaleString()} lines in ${lang.files} files</p>
+                </div>
+                `).join('')}
+            </div>
+            ` : ''}
         </div>
         ` : ''}
 
@@ -1690,7 +1973,7 @@ class HTMLGenerator {
             <h2 style="color: var(--accent); margin-bottom: 20px;">📝 Recent Commits</h2>
             ${data.commits.slice(0, 20).map(commit => `
                 <div class="commit-item">
-                    <span class="commit-hash">${commit.shortHash}</span>
+                    <span class="commit-hash">${commit.shortHash}${commit.repoName ? ` - ${commit.repoName}` : ''}</span>
                     <div class="commit-message">${commit.subject}</div>
                     <div class="commit-meta">
                         <span>👤 ${commit.author}</span>
@@ -1702,16 +1985,18 @@ class HTMLGenerator {
         </div>
 
         <div class="commits-list fade-in">
-            <h2 style="color: var(--accent); margin-bottom: 20px;">👥 Top Contributors</h2>
+            <h2 style="color: var(--accent); margin-bottom: 20px;">👥 Contributors (Deduplicated by Email)</h2>
             <div class="author-list">
-                ${data.authors.sort((a, b) => b.commits - a.commits).slice(0, 10).map(author => `
+                ${data.authors.sort((a, b) => b.commits - a.commits).slice(0, 15).map(author => `
                     <div class="author-card">
                         <div class="author-name">${author.name}</div>
+                        <div class="author-email">${author.email}</div>
                         <div class="author-stats">
                             <div>Commits: ${author.commits}</div>
                             <div>Lines Added: +${author.insertions}</div>
                             <div>Lines Removed: -${author.deletions}</div>
                             <div>Active: ${new Date(author.firstCommit).getFullYear()} - ${new Date(author.lastCommit).getFullYear()}</div>
+                            ${author.repos ? `<div>Repos: ${author.repos.join(', ')}</div>` : ''}
                         </div>
                     </div>
                 `).join('')}
@@ -1733,9 +2018,11 @@ class HTMLGenerator {
                         <p>${group.description || 'No description'}</p>
                         <p>Repositories: ${group.repos.length}</p>
                         <button class="btn btn-primary" onclick="loadGroup('${group.name}')">Load</button>
+                        <button class="btn btn-success" onclick="addCurrentToGroup('${group.name}')">Add Current</button>
                         <button class="btn btn-danger" onclick="deleteGroup('${group.name}')">Delete</button>
                     </div>
                 `).join('')}
+                ${groups.length === 0 ? '<p style="text-align: center; color: var(--text-secondary);">No groups yet. Create one!</p>' : ''}
             </div>
         </div>
     </div>
@@ -1756,6 +2043,23 @@ class HTMLGenerator {
                 <textarea id="groupDescription" placeholder="Optional description"></textarea>
             </div>
             <button class="btn btn-primary" onclick="createGroup()">Create Group</button>
+        </div>
+    </div>
+
+    <!-- Compare Modal -->
+    <div id="compareModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>⚖️ Compare With</h2>
+                <span class="close" onclick="closeCompareModal()">&times;</span>
+            </div>
+            <div class="form-group">
+                <label>Select repository or group to compare with</label>
+                <select id="compareTarget">
+                    ${comparisonTargets.map(target => `<option value="${target.type}:${target.name}">${target.type === 'group' ? '📦' : '📁'} ${target.name}</option>`).join('')}
+                </select>
+            </div>
+            <button class="btn btn-primary" onclick="compareWith()">Compare</button>
         </div>
     </div>
 
@@ -1826,8 +2130,37 @@ class HTMLGenerator {
             document.getElementById('newGroupModal').style.display = 'none';
         }
 
+        function openCompareModal() {
+            document.getElementById('compareModal').style.display = 'block';
+        }
+
+        function closeCompareModal() {
+            document.getElementById('compareModal').style.display = 'none';
+        }
+
         function loadGroup(groupName) {
             window.location.href = '/group/' + encodeURIComponent(groupName);
+        }
+
+        function addCurrentToGroup(groupName) {
+            const currentRepos = ${JSON.stringify(repoList.map(r => r.path))};
+            fetch('/api/groups/' + encodeURIComponent(groupName) + '/repos', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ repos: currentRepos })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert('Added to group!');
+                    location.reload();
+                } else {
+                    alert('Failed to add: ' + data.error);
+                }
+            })
+            .catch(error => {
+                alert('Error adding to group: ' + error.message);
+            });
         }
 
         function deleteGroup(groupName) {
@@ -1876,6 +2209,16 @@ class HTMLGenerator {
                 alert('Error creating group: ' + error.message);
             });
         }
+
+        function compareWith() {
+            const target = document.getElementById('compareTarget').value;
+            const [type, name] = target.split(':');
+            if (type === 'group') {
+                window.location.href = '/group/' + encodeURIComponent(name);
+            } else {
+                window.location.href = '/view?repo=' + name;
+            }
+        }
     </script>
 </body>
 </html>`;
@@ -1884,6 +2227,34 @@ class HTMLGenerator {
     static generateComparisonHTML(repoDataList, packComparison) {
         const repos = repoDataList.filter(r => r.data);
         if (repos.length < 2) return '<html><body>Need at least 2 repos for comparison</body></html>';
+
+        // Extract pack data for comparison
+        const packMetrics = {};
+        if (packComparison) {
+            repos.forEach(repo => {
+                const packData = repo.data.packAnalysis;
+                if (packData) {
+                    packMetrics[repo.name] = {
+                        realTotalSize: packData['Total Size Analyzer']?.realTotalSizeFormatted || 'N/A',
+                        totalSize: packData['Total Size Analyzer']?.totalSizeFormatted || 'N/A',
+                        codeSize: packData['Total Size Analyzer']?.codeSizeFormatted || 'N/A',
+                        binarySize: packData['Total Size Analyzer']?.binarySizeFormatted || 'N/A',
+                        archiveSize: packData['Total Size Analyzer']?.archiveSizeFormatted || 'N/A',
+                        gitSize: packData['Total Size Analyzer']?.gitSizeFormatted || 'N/A',
+                        codePurity: packData['Total Size Analyzer']?.codePurityRate || 'N/A',
+                        repoEfficiency: packData['Total Size Analyzer']?.repositoryEfficiencyRate || 'N/A',
+                        totalLines: packData['Lines of Code Analyzer']?.totalLinesFormatted || 'N/A',
+                        uniqueContributors: packData['Git Analyzer']?.totalUniqueContributors || 'N/A',
+                        totalCommits: packData['Git Analyzer']?.totalCommits || 'N/A',
+                        totalRepos: packData['Git Analyzer']?.totalRepositories || 'N/A',
+                        fileCount: packData['Total Size Analyzer']?.fileCount || 'N/A',
+                        dirCount: packData['Total Size Analyzer']?.dirCount || 'N/A',
+                        binaryFiles: packData['Binary Files Analyzer']?.totalCount || 'N/A',
+                        archiveFiles: packData['Archive Files Analyzer']?.totalCount || 'N/A'
+                    };
+                }
+            });
+        }
 
         return `
 <!DOCTYPE html>
@@ -1999,6 +2370,12 @@ class HTMLGenerator {
             color: var(--success);
             font-weight: bold;
         }
+
+        .section-header {
+            background: var(--accent);
+            color: var(--bg-primary);
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
@@ -2011,7 +2388,7 @@ class HTMLGenerator {
 
         <div class="header">
             <h1>🔍 Repository Comparison</h1>
-            <p style="color: var(--text-secondary);">Comparing ${repos.length} repositories</p>
+            <p style="color: var(--text-secondary);">Comparing ${repos.length} repositories/groups</p>
         </div>
 
         <div class="comparison-table">
@@ -2023,6 +2400,9 @@ class HTMLGenerator {
                     </tr>
                 </thead>
                 <tbody>
+                    <tr class="section-header">
+                        <td colspan="${repos.length + 1}">Git Metrics</td>
+                    </tr>
                     <tr>
                         <td>Total Commits</td>
                         ${repos.map(r => `<td class="${r.data.health.totalCommits === Math.max(...repos.map(x => x.data.health.totalCommits)) ? 'winner' : ''}">${r.data.health.totalCommits}</td>`).join('')}
@@ -2044,10 +2424,6 @@ class HTMLGenerator {
                         ${repos.map(r => `<td class="${r.data.health.totalFiles === Math.max(...repos.map(x => x.data.health.totalFiles)) ? 'winner' : ''}">${r.data.health.totalFiles}</td>`).join('')}
                     </tr>
                     <tr>
-                        <td>Repo Size</td>
-                        ${repos.map(r => `<td>${r.data.health.repoSize}</td>`).join('')}
-                    </tr>
-                    <tr>
                         <td>Active Days</td>
                         ${repos.map(r => `<td class="${r.data.health.daysActive === Math.max(...repos.map(x => x.data.health.daysActive)) ? 'winner' : ''}">${r.data.health.daysActive}</td>`).join('')}
                     </tr>
@@ -2065,55 +2441,59 @@ class HTMLGenerator {
                             return `<td>${total.toLocaleString()}</td>`;
                         }).join('')}
                     </tr>
-                </tbody>
-            </table>
-        </div>
 
-        ${packComparison ? `
-        <div class="header">
-            <h2>📦 Package Analysis Comparison</h2>
-        </div>
-        <div class="comparison-table">
-            <table>
-                <thead>
-                    <tr>
-                        <th>Package Metric</th>
-                        ${repos.map(r => `<th>${r.name}</th>`).join('')}
+                    ${packComparison ? `
+                    <tr class="section-header">
+                        <td colspan="${repos.length + 1}">Pack.js Metrics</td>
                     </tr>
-                </thead>
-                <tbody>
+                    <tr>
+                        <td>Real Total Size</td>
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.realTotalSize || 'N/A'}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Analyzed Size</td>
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.totalSize || 'N/A'}</td>`).join('')}
+                    </tr>
                     <tr>
                         <td>Code Size</td>
-                        ${repos.map(r => {
-                            const packData = r.data.packAnalysis;
-                            return `<td>${packData?.['Total Size Analyzer']?.codeSizeFormatted || 'N/A'}</td>`;
-                        }).join('')}
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.codeSize || 'N/A'}</td>`).join('')}
                     </tr>
                     <tr>
-                        <td>Code Purity</td>
-                        ${repos.map(r => {
-                            const packData = r.data.packAnalysis;
-                            return `<td>${packData?.['Total Size Analyzer']?.codePurityRate || 'N/A'}</td>`;
-                        }).join('')}
+                        <td>Binary Size</td>
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.binarySize || 'N/A'}</td>`).join('')}
                     </tr>
                     <tr>
-                        <td>Total Lines</td>
-                        ${repos.map(r => {
-                            const packData = r.data.packAnalysis;
-                            return `<td>${packData?.['Lines of Code Analyzer']?.totalLinesFormatted || 'N/A'}</td>`;
-                        }).join('')}
+                        <td>Archive Size</td>
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.archiveSize || 'N/A'}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Code Purity Rate</td>
+                        ${repos.map(r => `<td class="${packMetrics[r.name]?.codePurity ? 'winner' : ''}">${packMetrics[r.name]?.codePurity || 'N/A'}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Repository Efficiency</td>
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.repoEfficiency || 'N/A'}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Total Lines of Code</td>
+                        ${repos.map(r => `<td class="${packMetrics[r.name]?.totalLines === Math.max(...repos.map(x => packMetrics[x.name]?.totalLines ? parseInt(packMetrics[x.name].totalLines.replace(/,/g, '')) : 0)) ? 'winner' : ''}">${packMetrics[r.name]?.totalLines || 'N/A'}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Unique Contributors (Pack)</td>
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.uniqueContributors || 'N/A'}</td>`).join('')}
                     </tr>
                     <tr>
                         <td>Binary Files</td>
-                        ${repos.map(r => {
-                            const packData = r.data.packAnalysis;
-                            return `<td>${packData?.['Binary Files Analyzer']?.totalCount || '0'}</td>`;
-                        }).join('')}
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.binaryFiles || 'N/A'}</td>`).join('')}
                     </tr>
+                    <tr>
+                        <td>Archive Files</td>
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.archiveFiles || 'N/A'}</td>`).join('')}
+                    </tr>
+                    ` : ''}
                 </tbody>
             </table>
         </div>
-        ` : ''}
     </div>
 </body>
 </html>`;
@@ -2253,11 +2633,24 @@ try {
                     res.end('Repository data not found');
                     return;
                 }
+                
+                // Get comparison targets (other repos and groups)
+                const comparisonTargets = [];
+                this.repoDataList.forEach((r, i) => {
+                    if (i !== repoIndex) {
+                        comparisonTargets.push({ type: 'repo', name: i.toString() });
+                    }
+                });
+                this.cacheManager.getAllGroups().forEach(g => {
+                    comparisonTargets.push({ type: 'group', name: g.name });
+                });
+                
                 const options = {
                     repoList: this.repoDataList.map((r, i) => ({ name: r.name, path: r.path, index: i })),
                     currentIndex: repoIndex,
                     groups: this.cacheManager.getAllGroups(),
-                    currentGroup: this.currentGroup
+                    currentGroup: this.currentGroup,
+                    comparisonTargets
                 };
                 const html = HTMLGenerator.generateHTML(repoEntry.data, options);
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -2326,6 +2719,34 @@ try {
                         
                         res.writeHead(200, { 'Content-Type': 'application/json' });
                         res.end(JSON.stringify({ success: true, group: this.cacheManager.loadGroup(data.name) }));
+                    } catch (error) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: false, error: error.message }));
+                    }
+                });
+            }
+            // API: Add repos to group
+            else if (parsedUrl.pathname.startsWith('/api/groups/') && parsedUrl.pathname.endsWith('/repos') && req.method === 'POST') {
+                const groupName = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
+                let body = '';
+                req.on('data', chunk => { body += chunk; });
+                req.on('end', () => {
+                    try {
+                        const data = JSON.parse(body);
+                        const repos = data.repos || [];
+                        const groupData = this.cacheManager.loadGroup(groupName);
+                        
+                        if (!groupData) {
+                            res.writeHead(404, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ success: false, error: 'Group not found' }));
+                            return;
+                        }
+                        
+                        const mergedRepos = [...new Set([...groupData.repos, ...repos])];
+                        this.cacheManager.saveGroup(groupName, mergedRepos);
+                        
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: true, group: this.cacheManager.loadGroup(groupName) }));
                     } catch (error) {
                         res.writeHead(400, { 'Content-Type': 'application/json' });
                         res.end(JSON.stringify({ success: false, error: error.message }));
@@ -2536,7 +2957,8 @@ try {
                 // Run Pack analysis
                 let packAnalysis = null;
                 try {
-                    packAnalysis = await analyzeDirectories(repoPath);
+                    const packResult = await analyzeDirectories(repoPath);
+                    packAnalysis = packResult.report || packResult;
                 } catch (packError) {
                     console.error(`Pack analysis failed for ${repoName}: ${packError.message}`);
                     packAnalysis = null;
@@ -2544,7 +2966,7 @@ try {
 
                 const fullData = {
                     ...gitData,
-                    packAnalysis: packAnalysis?.report || packAnalysis,
+                    packAnalysis: packAnalysis,
                     repository: {
                         ...gitData.repository,
                         currentCommit: gitData.repository.currentCommit || 
@@ -2587,7 +3009,20 @@ try {
             data: this.analysisMap.get(p) || null
         }));
 
-        if (this.repoPaths.length === 1) {
+        // If this is a group, aggregate the data
+        if (this.currentGroup && this.repoDataList.length > 1) {
+            const aggregatedData = await GroupAnalyzer.analyzeGroupWithPack(this.repoDataList);
+            if (aggregatedData) {
+                this.repoDataList.push({
+                    path: `GROUP:${this.currentGroup}`,
+                    name: `📦 ${this.currentGroup} (Group)`,
+                    data: aggregatedData,
+                    isGroup: true
+                });
+            }
+        }
+
+        if (this.repoPaths.length === 1 && this.repoDataList.length === 1) {
             this.analysisData = this.repoDataList[0].data;
         }
 
@@ -2797,6 +3232,7 @@ export {
     ArgumentParser, 
     CacheManager, 
     findGitRepos,
+    GroupAnalyzer,
     analyzeDirectories
 };
 
