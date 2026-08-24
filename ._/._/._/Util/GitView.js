@@ -2,6 +2,8 @@
 
 /**
  * GitView - Comprehensive Git Repository Visualization and Analysis Tool
+ * Enhanced with Pack.js integration, grouping, and comparison features
+ * Group management available through web interface
  */
 
 import { spawnSync, spawn } from 'child_process';
@@ -11,6 +13,7 @@ import http from 'http';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { parse as parseUrl } from 'url';
 import crypto from 'crypto';
+import analyzeDirectories from '../Packager/Pack.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,12 +25,16 @@ const __dirname = path.dirname(__filename);
 class CacheManager {
     constructor() {
         this.cacheDir = path.join('/tmp', 'gitview-cache');
+        this.groupsFile = path.join(this.cacheDir, 'groups.json');
         this.ensureCacheDir();
     }
 
     ensureCacheDir() {
         if (!fs.existsSync(this.cacheDir)) {
             fs.mkdirSync(this.cacheDir, { recursive: true });
+        }
+        if (!fs.existsSync(this.groupsFile)) {
+            fs.writeFileSync(this.groupsFile, JSON.stringify({ groups: {} }, null, 2), 'utf8');
         }
     }
 
@@ -52,10 +59,93 @@ class CacheManager {
     save(repoPath, data) {
         const cachePath = this.getCachePath(repoPath);
         try {
-            fs.writeFileSync(cachePath, JSON.stringify(data, null, 2), 'utf8');
+            const cacheData = {
+                ...data,
+                cachedAt: new Date().toISOString(),
+                repoPath: path.resolve(repoPath)
+            };
+            fs.writeFileSync(cachePath, JSON.stringify(cacheData, null, 2), 'utf8');
         } catch (error) {
             console.error(`Failed to save cache for ${repoPath}: ${error.message}`);
         }
+    }
+
+    loadGroups() {
+        try {
+            const raw = fs.readFileSync(this.groupsFile, 'utf8');
+            return JSON.parse(raw);
+        } catch (error) {
+            return { groups: {} };
+        }
+    }
+
+    saveGroups(groupsData) {
+        try {
+            fs.writeFileSync(this.groupsFile, JSON.stringify(groupsData, null, 2), 'utf8');
+        } catch (error) {
+            console.error(`Failed to save groups: ${error.message}`);
+        }
+    }
+
+    saveGroup(groupName, repoPaths, description = '') {
+        const groupsData = this.loadGroups();
+        groupsData.groups[groupName] = {
+            name: groupName,
+            description: description,
+            repos: repoPaths.map(p => path.resolve(p)),
+            createdAt: groupsData.groups[groupName]?.createdAt || new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        };
+        this.saveGroups(groupsData);
+    }
+
+    loadGroup(groupName) {
+        const groupsData = this.loadGroups();
+        return groupsData.groups[groupName] || null;
+    }
+
+    deleteGroup(groupName) {
+        const groupsData = this.loadGroups();
+        if (groupsData.groups[groupName]) {
+            delete groupsData.groups[groupName];
+            this.saveGroups(groupsData);
+            return true;
+        }
+        return false;
+    }
+
+    getAllGroups() {
+        const groupsData = this.loadGroups();
+        return Object.values(groupsData.groups);
+    }
+
+    addRepoToGroup(groupName, repoPath) {
+        const groupsData = this.loadGroups();
+        if (groupsData.groups[groupName]) {
+            const repoAbs = path.resolve(repoPath);
+            if (!groupsData.groups[groupName].repos.includes(repoAbs)) {
+                groupsData.groups[groupName].repos.push(repoAbs);
+                groupsData.groups[groupName].updatedAt = new Date().toISOString();
+                this.saveGroups(groupsData);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    removeRepoFromGroup(groupName, repoPath) {
+        const groupsData = this.loadGroups();
+        if (groupsData.groups[groupName]) {
+            const repoAbs = path.resolve(repoPath);
+            const index = groupsData.groups[groupName].repos.indexOf(repoAbs);
+            if (index > -1) {
+                groupsData.groups[groupName].repos.splice(index, 1);
+                groupsData.groups[groupName].updatedAt = new Date().toISOString();
+                this.saveGroups(groupsData);
+                return true;
+            }
+        }
+        return false;
     }
 }
 
@@ -71,7 +161,10 @@ class ArgumentParser {
             help: false,
             port: 8080,
             repoPath: process.cwd(),
-            dir: false
+            dir: false,
+            group: null,
+            createGroup: null,
+            addToGroup: null
         };
         this.parse();
     }
@@ -108,10 +201,29 @@ class ArgumentParser {
                 case '--dir':
                     this.args.dir = true;
                     break;
+                case '--group':
+                case '-g':
+                    if (i + 1 < args.length) {
+                        this.args.group = args[i + 1];
+                        i++;
+                    }
+                    break;
+                case '--create-group':
+                    if (i + 1 < args.length) {
+                        this.args.createGroup = args[i + 1];
+                        i++;
+                    }
+                    break;
+                case '--add-to-group':
+                    if (i + 1 < args.length) {
+                        this.args.addToGroup = args[i + 1];
+                        i++;
+                    }
+                    break;
             }
         }
 
-        if (!this.args.html && !this.args.help) {
+        if (!this.args.html && !this.args.help && !this.args.createGroup && !this.args.addToGroup) {
             this.args.server = true;
         }
     }
@@ -132,12 +244,17 @@ OPTIONS:
     --port, -p <number>     Specify port (default: 8080)
     --repo, -r <path>       Specify repository path
     --dir                   Analyze all repositories inside a directory
+    --group, -g <name>      Load a specific group of repositories
+    --create-group <name>   Create a new group (requires --dir or --repo)
+    --add-to-group <name>   Add current repos to existing group
 
 EXAMPLES:
     node gitview.js                    # Start server on current repo
     node gitview.js --html             # Generate gitview.html only
     node gitview.js --port 3000        # Start server on port 3000
     node gitview.js --dir /path/to/repos   # Analyze all repos in directory
+    node gitview.js --group my-group   # Load a saved group
+    node gitview.js --create-group team-repos --dir /path/to/repos
         `);
     }
 }
@@ -213,6 +330,7 @@ class GitView {
         
         const remoteUrl = this.executeGitOptional(['config', '--get', 'remote.origin.url']);
         const currentBranch = this.executeGitOptional(['rev-parse', '--abbrev-ref', 'HEAD']);
+        const currentCommit = this.executeGitOptional(['rev-parse', 'HEAD']);
         
         return {
             name: path.basename(this.repoPath),
@@ -221,6 +339,7 @@ class GitView {
             remoteUrl: remoteUrl,
             defaultBranch: currentBranch || 'main',
             currentBranch: currentBranch,
+            currentCommit: currentCommit,
             isBare: this.executeGit(['rev-parse', '--is-bare-repository']) === 'true',
             isShallow: this.executeGit(['rev-parse', '--is-shallow-repository']) === 'true',
             gitVersion: this.executeGit(['--version']).replace('git version ', ''),
@@ -599,7 +718,7 @@ class GitView {
 // ============================================================================
 
 class LoadingPageGenerator {
-    static generateLoadingHTML(repoName) {
+    static generateLoadingHTML(repoName, isGroup = false) {
         return `
 <!DOCTYPE html>
 <html lang="en">
@@ -768,7 +887,7 @@ class LoadingPageGenerator {
 <body>
     <div class="loading-container">
         <div class="loading-header">
-            <h1>🚀 GitView</h1>
+            <h1>🚀 GitView ${isGroup ? '- Group' : ''}</h1>
             <p>Analyzing ${repoName}</p>
         </div>
 
@@ -827,11 +946,16 @@ class LoadingPageGenerator {
                 <span class="stage-name">Repository Health</span>
                 <span class="stage-status">Waiting...</span>
             </li>
+            <li class="stage-item" id="stage-pack">
+                <span class="stage-icon">📦</span>
+                <span class="stage-name">Package Analysis</span>
+                <span class="stage-status">Waiting...</span>
+            </li>
         </ul>
     </div>
 
     <script>
-        const stages = ['basic', 'branches', 'tags', 'commits', 'authors', 'time', 'yearly', 'files', 'health'];
+        const stages = ['basic', 'branches', 'tags', 'commits', 'authors', 'time', 'yearly', 'files', 'health', 'pack'];
         let currentStage = 0;
 
         function updateProgress(stage, percent, message) {
@@ -863,7 +987,6 @@ class LoadingPageGenerator {
             }
         }
 
-        // Poll for progress updates
         function pollProgress() {
             fetch('/api/progress')
                 .then(response => response.json())
@@ -873,7 +996,7 @@ class LoadingPageGenerator {
                         setTimeout(pollProgress, 500);
                     } else {
                         setTimeout(() => {
-                            window.location.href = '/view';
+                            window.location.href = data.redirectUrl || '/view';
                         }, 1000);
                     }
                 })
@@ -883,7 +1006,6 @@ class LoadingPageGenerator {
                 });
         }
 
-        // Start polling
         pollProgress();
     </script>
 </body>
@@ -897,12 +1019,13 @@ class LoadingPageGenerator {
 
 class HTMLGenerator {
     static generateHTML(data, options = {}) {
-        const { repoList = [], currentIndex = 0 } = options;
+        const { repoList = [], currentIndex = 0, groups = [], currentGroup = null } = options;
         const hasMultiple = repoList.length > 1;
+        const hasGroups = groups.length > 0;
         const monthlyData = data.commitsByMonth;
         const yearlyData = data.yearlySummary;
+        const packData = data.packAnalysis || null;
 
-        // Sort keys chronologically (ascending: oldest to newest)
         const monthlyKeys = Object.keys(monthlyData).sort();
         const yearlyKeys = Object.keys(yearlyData).sort();
 
@@ -960,6 +1083,34 @@ class HTMLGenerator {
         .header h1 {
             color: var(--accent);
             margin-bottom: 10px;
+        }
+
+        .nav-bar {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .nav-link {
+            color: var(--accent);
+            text-decoration: none;
+            padding: 8px 16px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+
+        .nav-link:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .nav-link.active {
+            background: var(--accent);
+            color: var(--bg-primary);
+            border-color: var(--accent);
         }
 
         .repo-selector {
@@ -1088,7 +1239,6 @@ class HTMLGenerator {
 
         .chart {
             position: relative;
-            /* Remove overflow: hidden to allow tooltip to appear outside */
             overflow: visible;
         }
 
@@ -1231,6 +1381,123 @@ class HTMLGenerator {
             margin-top: 5px;
         }
 
+        .pack-info {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .pack-info h2 {
+            color: var(--accent);
+            margin-bottom: 15px;
+        }
+
+        .pack-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+
+        .pack-item {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 15px;
+        }
+
+        .pack-item h4 {
+            color: var(--accent);
+            margin-bottom: 8px;
+            font-size: 13px;
+        }
+
+        .pack-item p {
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+
+        .modal-content {
+            background: var(--bg-secondary);
+            margin: 5% auto;
+            padding: 20px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            width: 80%;
+            max-width: 600px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .close {
+            color: var(--text-secondary);
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        .close:hover {
+            color: var(--text-primary);
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: var(--text-secondary);
+        }
+
+        .form-group input, .form-group textarea, .form-group select {
+            width: 100%;
+            padding: 8px 12px;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: var(--bg-primary);
+            border-color: var(--accent);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+            color: var(--bg-primary);
+            border-color: var(--danger);
+        }
+
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
@@ -1257,6 +1524,13 @@ class HTMLGenerator {
 </head>
 <body>
     <div class="container">
+        <div class="nav-bar fade-in">
+            <a href="/" class="nav-link">🏠 Home</a>
+            ${hasMultiple ? `<a href="/compare" class="nav-link">🔍 Comparison</a>` : ''}
+            <button class="nav-link" onclick="openGroupsModal()">📦 Groups</button>
+            <button class="nav-link" onclick="openNewGroupModal()">➕ New Group</button>
+        </div>
+
         ${hasMultiple ? `
         <div class="repo-selector fade-in">
             <label for="repoSelect">📁 Repository:</label>
@@ -1322,6 +1596,38 @@ class HTMLGenerator {
                 <div class="stat-label">Repo Size</div>
             </div>
         </div>
+
+        ${packData ? `
+        <div class="pack-info fade-in">
+            <h2>📦 Package Analysis</h2>
+            <div class="pack-grid">
+                <div class="pack-item">
+                    <h4>💾 Real Total Size</h4>
+                    <p>${packData['Total Size Analyzer']?.realTotalSizeFormatted || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>📝 Code Size</h4>
+                    <p>${packData['Total Size Analyzer']?.codeSizeFormatted || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>💎 Code Purity</h4>
+                    <p>${packData['Total Size Analyzer']?.codePurityRate || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>📊 Total Lines</h4>
+                    <p>${packData['Lines of Code Analyzer']?.totalLinesFormatted || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>👥 Git Contributors</h4>
+                    <p>${packData['Git Analyzer']?.totalUniqueContributors || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>🔀 Git Repos</h4>
+                    <p>${packData['Git Analyzer']?.totalRepositories || 'N/A'}</p>
+                </div>
+            </div>
+        </div>
+        ` : ''}
 
         <div class="chart-container fade-in">
             <div class="chart-header">
@@ -1413,6 +1719,46 @@ class HTMLGenerator {
         </div>
     </div>
 
+    <!-- Groups Modal -->
+    <div id="groupsModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>📦 Groups</h2>
+                <span class="close" onclick="closeGroupsModal()">&times;</span>
+            </div>
+            <div id="groupsList">
+                ${groups.map(group => `
+                    <div class="info-card" style="margin-bottom: 10px;">
+                        <h3>${group.name}</h3>
+                        <p>${group.description || 'No description'}</p>
+                        <p>Repositories: ${group.repos.length}</p>
+                        <button class="btn btn-primary" onclick="loadGroup('${group.name}')">Load</button>
+                        <button class="btn btn-danger" onclick="deleteGroup('${group.name}')">Delete</button>
+                    </div>
+                `).join('')}
+            </div>
+        </div>
+    </div>
+
+    <!-- New Group Modal -->
+    <div id="newGroupModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>➕ Create New Group</h2>
+                <span class="close" onclick="closeNewGroupModal()">&times;</span>
+            </div>
+            <div class="form-group">
+                <label>Group Name</label>
+                <input type="text" id="groupName" placeholder="My Group">
+            </div>
+            <div class="form-group">
+                <label>Description</label>
+                <textarea id="groupDescription" placeholder="Optional description"></textarea>
+            </div>
+            <button class="btn btn-primary" onclick="createGroup()">Create Group</button>
+        </div>
+    </div>
+
     <script>
         function switchView(view) {
             const monthlyBars = document.getElementById('monthlyBars');
@@ -1438,23 +1784,19 @@ class HTMLGenerator {
             const chartRect = chart.getBoundingClientRect();
             const barRect = element.getBoundingClientRect();
             
-            // Set tooltip content
             document.getElementById('tooltipTitle').textContent = element.dataset.period;
             document.getElementById('tooltipCommits').textContent = element.dataset.commits;
             document.getElementById('tooltipAuthors').textContent = element.dataset.authors;
             document.getElementById('tooltipInsertions').textContent = '+' + element.dataset.insertions;
             document.getElementById('tooltipDeletions').textContent = '-' + element.dataset.deletions;
             
-            // Make tooltip visible first to measure its dimensions
             tooltip.classList.add('visible');
             const tooltipWidth = tooltip.offsetWidth;
             const tooltipHeight = tooltip.offsetHeight;
             
-            // Horizontal positioning: center of bar, clamped to chart bounds
             let left = barRect.left - chartRect.left + barRect.width / 2 - tooltipWidth / 2;
             left = Math.max(0, Math.min(left, chartRect.width - tooltipWidth));
             
-            // Vertical positioning: above bar if enough space, otherwise below
             let top = barRect.top - chartRect.top - tooltipHeight - 10;
             if (top < 0) {
                 top = barRect.bottom - chartRect.top + 10;
@@ -1467,14 +1809,319 @@ class HTMLGenerator {
         function hideTooltip() {
             document.getElementById('tooltip').classList.remove('visible');
         }
+
+        function openGroupsModal() {
+            document.getElementById('groupsModal').style.display = 'block';
+        }
+
+        function closeGroupsModal() {
+            document.getElementById('groupsModal').style.display = 'none';
+        }
+
+        function openNewGroupModal() {
+            document.getElementById('newGroupModal').style.display = 'block';
+        }
+
+        function closeNewGroupModal() {
+            document.getElementById('newGroupModal').style.display = 'none';
+        }
+
+        function loadGroup(groupName) {
+            window.location.href = '/group/' + encodeURIComponent(groupName);
+        }
+
+        function deleteGroup(groupName) {
+            if (confirm('Are you sure you want to delete group "' + groupName + '"?')) {
+                fetch('/api/groups/' + encodeURIComponent(groupName), { method: 'DELETE' })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            location.reload();
+                        } else {
+                            alert('Failed to delete group: ' + data.error);
+                        }
+                    })
+                    .catch(error => {
+                        alert('Error deleting group: ' + error.message);
+                    });
+            }
+        }
+
+        function createGroup() {
+            const name = document.getElementById('groupName').value.trim();
+            const description = document.getElementById('groupDescription').value.trim();
+            
+            if (!name) {
+                alert('Please enter a group name');
+                return;
+            }
+
+            const repos = ${JSON.stringify(repoList.map(r => r.path))};
+            
+            fetch('/api/groups', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, description, repos })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    closeNewGroupModal();
+                    location.reload();
+                } else {
+                    alert('Failed to create group: ' + data.error);
+                }
+            })
+            .catch(error => {
+                alert('Error creating group: ' + error.message);
+            });
+        }
     </script>
+</body>
+</html>`;
+    }
+
+    static generateComparisonHTML(repoDataList, packComparison) {
+        const repos = repoDataList.filter(r => r.data);
+        if (repos.length < 2) return '<html><body>Need at least 2 repos for comparison</body></html>';
+
+        return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GitView - Comparison</title>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent: #58a6ff;
+            --success: #3fb950;
+            --warning: #d29922;
+            --danger: #f85149;
+            --border: #30363d;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .header h1 {
+            color: var(--accent);
+            margin-bottom: 10px;
+        }
+
+        .nav-bar {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .nav-link {
+            color: var(--accent);
+            text-decoration: none;
+            padding: 8px 16px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+
+        .nav-link:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .nav-link.active {
+            background: var(--accent);
+            color: var(--bg-primary);
+            border-color: var(--accent);
+        }
+
+        .comparison-table {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow-x: auto;
+            margin-bottom: 20px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            background: var(--bg-tertiary);
+            color: var(--accent);
+            font-weight: bold;
+        }
+
+        tr:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .winner {
+            color: var(--success);
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="nav-bar">
+            <a href="/" class="nav-link">🏠 Home</a>
+            <a href="/view?repo=0" class="nav-link">📊 Single View</a>
+            <a href="/compare" class="nav-link active">🔍 Comparison</a>
+        </div>
+
+        <div class="header">
+            <h1>🔍 Repository Comparison</h1>
+            <p style="color: var(--text-secondary);">Comparing ${repos.length} repositories</p>
+        </div>
+
+        <div class="comparison-table">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Metric</th>
+                        ${repos.map(r => `<th>${r.name}</th>`).join('')}
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Total Commits</td>
+                        ${repos.map(r => `<td class="${r.data.health.totalCommits === Math.max(...repos.map(x => x.data.health.totalCommits)) ? 'winner' : ''}">${r.data.health.totalCommits}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Contributors</td>
+                        ${repos.map(r => `<td class="${r.data.authors.length === Math.max(...repos.map(x => x.data.authors.length)) ? 'winner' : ''}">${r.data.authors.length}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Branches</td>
+                        ${repos.map(r => `<td class="${r.data.branches.length === Math.max(...repos.map(x => x.data.branches.length)) ? 'winner' : ''}">${r.data.branches.length}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Tags</td>
+                        ${repos.map(r => `<td class="${r.data.tags.length === Math.max(...repos.map(x => x.data.tags.length)) ? 'winner' : ''}">${r.data.tags.length}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Files</td>
+                        ${repos.map(r => `<td class="${r.data.health.totalFiles === Math.max(...repos.map(x => x.data.health.totalFiles)) ? 'winner' : ''}">${r.data.health.totalFiles}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Repo Size</td>
+                        ${repos.map(r => `<td>${r.data.health.repoSize}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Active Days</td>
+                        ${repos.map(r => `<td class="${r.data.health.daysActive === Math.max(...repos.map(x => x.data.health.daysActive)) ? 'winner' : ''}">${r.data.health.daysActive}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Total Insertions</td>
+                        ${repos.map(r => {
+                            const total = r.data.authors.reduce((sum, a) => sum + a.insertions, 0);
+                            return `<td>${total.toLocaleString()}</td>`;
+                        }).join('')}
+                    </tr>
+                    <tr>
+                        <td>Total Deletions</td>
+                        ${repos.map(r => {
+                            const total = r.data.authors.reduce((sum, a) => sum + a.deletions, 0);
+                            return `<td>${total.toLocaleString()}</td>`;
+                        }).join('')}
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        ${packComparison ? `
+        <div class="header">
+            <h2>📦 Package Analysis Comparison</h2>
+        </div>
+        <div class="comparison-table">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Package Metric</th>
+                        ${repos.map(r => `<th>${r.name}</th>`).join('')}
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Code Size</td>
+                        ${repos.map(r => {
+                            const packData = r.data.packAnalysis;
+                            return `<td>${packData?.['Total Size Analyzer']?.codeSizeFormatted || 'N/A'}</td>`;
+                        }).join('')}
+                    </tr>
+                    <tr>
+                        <td>Code Purity</td>
+                        ${repos.map(r => {
+                            const packData = r.data.packAnalysis;
+                            return `<td>${packData?.['Total Size Analyzer']?.codePurityRate || 'N/A'}</td>`;
+                        }).join('')}
+                    </tr>
+                    <tr>
+                        <td>Total Lines</td>
+                        ${repos.map(r => {
+                            const packData = r.data.packAnalysis;
+                            return `<td>${packData?.['Lines of Code Analyzer']?.totalLinesFormatted || 'N/A'}</td>`;
+                        }).join('')}
+                    </tr>
+                    <tr>
+                        <td>Binary Files</td>
+                        ${repos.map(r => {
+                            const packData = r.data.packAnalysis;
+                            return `<td>${packData?.['Binary Files Analyzer']?.totalCount || '0'}</td>`;
+                        }).join('')}
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        ` : ''}
+    </div>
 </body>
 </html>`;
     }
 }
 
 // ============================================================================
-// WEB SERVER WITH PROGRESS TRACKING (ASYNC USING CHILD PROCESS)
+// WEB SERVER WITH PROGRESS TRACKING AND GROUP MANAGEMENT
 // ============================================================================
 
 class GitViewServer {
@@ -1489,14 +2136,17 @@ class GitViewServer {
             message: 'Starting analysis...',
             repoIndex: 0,
             totalRepos: this.repoPaths.length,
-            repoName: ''
+            repoName: '',
+            redirectUrl: '/view'
         };
-        this.analysisMap = new Map(); // repoPath -> data
-        this.repoDataList = [];        // { path, name, data }
-        this.analysisData = null;      // for single repo compatibility
+        this.analysisMap = new Map();
+        this.repoDataList = [];
+        this.analysisData = null;
         this.analysisComplete = false;
         this.isAnalyzing = false;
         this.workerPath = this.prepareWorkerFile();
+        this.currentGroup = null;
+        this.groups = this.cacheManager.getAllGroups();
     }
 
     resolveRepoPaths(repoInput) {
@@ -1509,7 +2159,17 @@ class GitViewServer {
         if (repoInput && repoInput.repoPath) {
             return [path.resolve(repoInput.repoPath)];
         }
-        throw new Error('Invalid repository input. Expected string, array, or GitView instance.');
+        if (repoInput && repoInput.group) {
+            this.currentGroup = repoInput.group;
+            const groupData = this.cacheManager.loadGroup(repoInput.group);
+            if (groupData) {
+                return groupData.repos;
+            }
+        }
+        if (repoInput && repoInput.repos) {
+            return repoInput.repos.map(p => path.resolve(p));
+        }
+        throw new Error('Invalid repository input. Expected string, array, group, or GitView instance.');
     }
 
     prepareWorkerFile() {
@@ -1539,30 +2199,34 @@ try {
             if (parsedUrl.pathname === '/') {
                 if (!this.analysisComplete) {
                     if (!this.isAnalyzing) {
-                        // Send loading page immediately, then start analysis async
                         const repoName = this.repoPaths.length === 1 
                             ? path.basename(this.repoPaths[0]) 
                             : `${this.repoPaths.length} repositories`;
-                        const loadingHTML = LoadingPageGenerator.generateLoadingHTML(repoName);
+                        const loadingHTML = LoadingPageGenerator.generateLoadingHTML(repoName, !!this.currentGroup);
                         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                         res.end(loadingHTML);
                         
-                        // Start analysis without blocking
                         this.startAnalysis().catch(err => {
                             console.error('Analysis failed:', err);
-                            this.progress = { stage:'error', percent:100, message:err.message, repoIndex:0,totalRepos:this.repoPaths.length,repoName:'' };
+                            this.progress = { 
+                                stage:'error', 
+                                percent:100, 
+                                message:err.message, 
+                                repoIndex:0,
+                                totalRepos:this.repoPaths.length,
+                                repoName:'',
+                                redirectUrl: '/view'
+                            };
                         });
                     } else {
-                        // Already analyzing, serve loading page again
                         const repoName = this.repoPaths.length === 1 
                             ? path.basename(this.repoPaths[0]) 
                             : `${this.repoPaths.length} repositories`;
-                        const loadingHTML = LoadingPageGenerator.generateLoadingHTML(repoName);
+                        const loadingHTML = LoadingPageGenerator.generateLoadingHTML(repoName, !!this.currentGroup);
                         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                         res.end(loadingHTML);
                     }
                 } else {
-                    // Redirect to first repo view
                     const redirectUrl = this.repoPaths.length > 1 ? '/view?repo=0' : '/view';
                     res.writeHead(302, { 'Location': redirectUrl });
                     res.end();
@@ -1591,11 +2255,90 @@ try {
                 }
                 const options = {
                     repoList: this.repoDataList.map((r, i) => ({ name: r.name, path: r.path, index: i })),
-                    currentIndex: repoIndex
+                    currentIndex: repoIndex,
+                    groups: this.cacheManager.getAllGroups(),
+                    currentGroup: this.currentGroup
                 };
                 const html = HTMLGenerator.generateHTML(repoEntry.data, options);
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
                 res.end(html);
+            }
+            // Serve comparison view
+            else if (parsedUrl.pathname === '/compare') {
+                if (!this.analysisComplete) {
+                    res.writeHead(302, { 'Location': '/' });
+                    res.end();
+                    return;
+                }
+
+                const packComparison = this.repoDataList.some(r => r.data && r.data.packAnalysis);
+                const html = HTMLGenerator.generateComparisonHTML(this.repoDataList, packComparison);
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(html);
+            }
+            // Serve group view
+            else if (parsedUrl.pathname.startsWith('/group/')) {
+                const groupName = decodeURIComponent(parsedUrl.pathname.replace('/group/', ''));
+                const groupData = this.cacheManager.loadGroup(groupName);
+                
+                if (!groupData) {
+                    res.writeHead(404, { 'Content-Type': 'text/plain' });
+                    res.end('Group not found');
+                    return;
+                }
+
+                // Redirect to main page with group loading
+                this.repoPaths = groupData.repos;
+                this.currentGroup = groupName;
+                this.analysisComplete = false;
+                this.isAnalyzing = false;
+                this.analysisMap.clear();
+                this.repoDataList = [];
+                
+                res.writeHead(302, { 'Location': '/' });
+                res.end();
+                
+                // Start analysis for the group
+                this.startAnalysis().catch(err => {
+                    console.error('Group analysis failed:', err);
+                });
+            }
+            // API: Get groups
+            else if (parsedUrl.pathname === '/api/groups' && req.method === 'GET') {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(this.cacheManager.getAllGroups(), null, 2));
+            }
+            // API: Create group
+            else if (parsedUrl.pathname === '/api/groups' && req.method === 'POST') {
+                let body = '';
+                req.on('data', chunk => { body += chunk; });
+                req.on('end', () => {
+                    try {
+                        const data = JSON.parse(body);
+                        if (!data.name) {
+                            res.writeHead(400, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ success: false, error: 'Group name required' }));
+                            return;
+                        }
+                        
+                        const repos = data.repos || this.repoPaths;
+                        this.cacheManager.saveGroup(data.name, repos, data.description || '');
+                        
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: true, group: this.cacheManager.loadGroup(data.name) }));
+                    } catch (error) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ success: false, error: error.message }));
+                    }
+                });
+            }
+            // API: Delete group
+            else if (parsedUrl.pathname.startsWith('/api/groups/') && req.method === 'DELETE') {
+                const groupName = decodeURIComponent(parsedUrl.pathname.replace('/api/groups/', ''));
+                const success = this.cacheManager.deleteGroup(groupName);
+                
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success, error: success ? null : 'Group not found' }));
             }
             // Progress API endpoint
             else if (parsedUrl.pathname === '/api/progress') {
@@ -1662,15 +2405,24 @@ try {
 
         this.server.listen(this.port, () => {
             console.log(`\n🚀 GitView server is running at: http://localhost:${this.port}`);
+            if (this.currentGroup) {
+                console.log(`📦 Group: ${this.currentGroup}`);
+            }
             if (this.repoPaths.length === 1) {
                 console.log(`📁 Repository: ${this.repoPaths[0]}`);
             } else {
                 console.log(`📁 Repositories (${this.repoPaths.length}):`);
                 this.repoPaths.forEach(p => console.log(`   - ${p}`));
             }
-            console.log(`📊 Loading page: http://localhost:${this.port}/`);
+            if (this.groups.length > 0) {
+                console.log(`\n📦 Available Groups:`);
+                this.groups.forEach(g => console.log(`   - ${g.name} (${g.repos.length} repos)`));
+            }
+            console.log(`\n📊 Loading page: http://localhost:${this.port}/`);
             console.log(`🔍 View: http://localhost:${this.port}/view`);
+            console.log(`🔍 Comparison: http://localhost:${this.port}/compare`);
             console.log(`📡 API: http://localhost:${this.port}/api/data`);
+            console.log(`📦 Groups API: http://localhost:${this.port}/api/groups`);
             console.log(`\nPress Ctrl+C to stop the server\n`);
         });
 
@@ -1692,7 +2444,25 @@ try {
             const repoName = path.basename(repoPath);
 
             // Check cache
-            const cached = this.cacheManager.load(repoPath);
+            let cached = this.cacheManager.load(repoPath);
+            
+            // Check if the repo has changed since caching
+            if (cached) {
+                try {
+                    const gitView = new GitView(repoPath);
+                    const currentCommit = gitView.executeGitOptional(['rev-parse', 'HEAD']);
+                    const cachedCommit = cached.repository?.currentCommit || null;
+                    
+                    if (!cachedCommit || currentCommit !== cachedCommit) {
+                        console.log(`📝 Changes detected in ${repoName}, re-analyzing...`);
+                        cached = null;
+                    }
+                } catch (error) {
+                    console.log(`⚠️ Failed to check git status for ${repoName}, re-analyzing...`);
+                    cached = null;
+                }
+            }
+            
             if (cached) {
                 this.analysisMap.set(repoPath, cached);
                 completed++;
@@ -1702,14 +2472,15 @@ try {
                     message: `Loaded from cache: ${repoName}`,
                     repoIndex: i,
                     totalRepos: total,
-                    repoName
+                    repoName,
+                    redirectUrl: this.repoPaths.length > 1 ? '/view?repo=0' : '/view'
                 };
                 continue;
             }
 
-            // Analyze in child process
+            // Analyze git data
             try {
-                await new Promise((resolve, reject) => {
+                const gitData = await new Promise((resolve, reject) => {
                     let settled = false;
                     const worker = spawn('node', [this.workerPath, repoPath], {
                         stdio: ['ignore', 'pipe', 'pipe', 'ipc']
@@ -1718,20 +2489,19 @@ try {
                     worker.on('message', (msg) => {
                         if (settled) return;
                         if (msg.type === 'progress') {
-                            const overall = Math.round((i / total) * 100 + (msg.percent / total));
+                            const overall = Math.round((i / total) * 100 + (msg.percent / total) * 0.7);
                             this.progress = {
                                 stage: msg.stage,
                                 percent: overall,
                                 message: `[${repoName}] ${msg.message}`,
                                 repoIndex: i,
                                 totalRepos: total,
-                                repoName
+                                repoName,
+                                redirectUrl: this.repoPaths.length > 1 ? '/view?repo=0' : '/view'
                             };
                         } else if (msg.type === 'complete') {
                             settled = true;
-                            this.analysisMap.set(repoPath, msg.data);
-                            this.cacheManager.save(repoPath, msg.data);
-                            resolve();
+                            resolve(msg.data);
                         } else if (msg.type === 'error') {
                             settled = true;
                             reject(new Error(msg.error));
@@ -1752,6 +2522,38 @@ try {
                         }
                     });
                 });
+
+                this.progress = {
+                    stage: 'pack',
+                    percent: Math.round((i / total) * 100 + 70 / total),
+                    message: `[${repoName}] Running Pack analysis...`,
+                    repoIndex: i,
+                    totalRepos: total,
+                    repoName,
+                    redirectUrl: this.repoPaths.length > 1 ? '/view?repo=0' : '/view'
+                };
+
+                // Run Pack analysis
+                let packAnalysis = null;
+                try {
+                    packAnalysis = await analyzeDirectories(repoPath);
+                } catch (packError) {
+                    console.error(`Pack analysis failed for ${repoName}: ${packError.message}`);
+                    packAnalysis = null;
+                }
+
+                const fullData = {
+                    ...gitData,
+                    packAnalysis: packAnalysis?.report || packAnalysis,
+                    repository: {
+                        ...gitData.repository,
+                        currentCommit: gitData.repository.currentCommit || 
+                                      new GitView(repoPath).executeGitOptional(['rev-parse', 'HEAD'])
+                    }
+                };
+
+                this.analysisMap.set(repoPath, fullData);
+                this.cacheManager.save(repoPath, fullData);
                 completed++;
                 this.progress = {
                     stage: 'complete',
@@ -1759,7 +2561,8 @@ try {
                     message: `Analyzed: ${repoName}`,
                     repoIndex: i,
                     totalRepos: total,
-                    repoName
+                    repoName,
+                    redirectUrl: this.repoPaths.length > 1 ? '/view?repo=0' : '/view'
                 };
             } catch (error) {
                 console.error(`Error analyzing ${repoPath}: ${error.message}`);
@@ -1771,7 +2574,8 @@ try {
                     message: `Error analyzing ${repoName}: ${error.message}`,
                     repoIndex: i,
                     totalRepos: total,
-                    repoName
+                    repoName,
+                    redirectUrl: this.repoPaths.length > 1 ? '/view?repo=0' : '/view'
                 };
             }
         }
@@ -1819,7 +2623,7 @@ function findGitRepos(rootDir) {
         try {
             entries = fs.readdirSync(dir, { withFileTypes: true });
         } catch {
-            return; // ignore permission errors
+            return;
         }
         for (const entry of entries) {
             if (entry.name === '.git' && entry.isDirectory()) {
@@ -1844,7 +2648,7 @@ class GitViewApp {
         this.run();
     }
 
-    run() {
+    async run() {
         if (this.parser.args.help) {
             this.parser.showHelp();
             return;
@@ -1852,7 +2656,50 @@ class GitViewApp {
 
         try {
             let repoInput;
-            if (this.parser.args.dir) {
+            
+            // Handle group operations
+            if (this.parser.args.createGroup) {
+                const groupName = this.parser.args.createGroup;
+                const repos = this.parser.args.dir 
+                    ? findGitRepos(this.parser.args.repoPath) 
+                    : [this.parser.args.repoPath];
+                
+                this.cacheManager.saveGroup(groupName, repos);
+                console.log(`✅ Group "${groupName}" created with ${repos.length} repositories`);
+                return;
+            }
+            
+            if (this.parser.args.addToGroup) {
+                const groupName = this.parser.args.addToGroup;
+                const repos = this.parser.args.dir 
+                    ? findGitRepos(this.parser.args.repoPath) 
+                    : [this.parser.args.repoPath];
+                
+                const existingGroup = this.cacheManager.loadGroup(groupName);
+                if (existingGroup) {
+                    const mergedRepos = [...new Set([...existingGroup.repos, ...repos])];
+                    this.cacheManager.saveGroup(groupName, mergedRepos);
+                    console.log(`✅ Added ${repos.length} repositories to group "${groupName}" (${mergedRepos.length} total)`);
+                } else {
+                    this.cacheManager.saveGroup(groupName, repos);
+                    console.log(`✅ Group "${groupName}" created with ${repos.length} repositories`);
+                }
+                return;
+            }
+            
+            // Load group if specified
+            if (this.parser.args.group) {
+                const groupData = this.cacheManager.loadGroup(this.parser.args.group);
+                if (!groupData) {
+                    console.error(`❌ Group "${this.parser.args.group}" not found`);
+                    process.exit(1);
+                }
+                console.log(`📦 Loading group "${this.parser.args.group}" with ${groupData.repos.length} repositories`);
+                repoInput = {
+                    group: this.parser.args.group,
+                    repos: groupData.repos
+                };
+            } else if (this.parser.args.dir) {
                 const repos = findGitRepos(this.parser.args.repoPath);
                 if (repos.length === 0) {
                     console.error(`❌ No .git repositories found in ${this.parser.args.repoPath}`);
@@ -1866,39 +2713,61 @@ class GitViewApp {
 
             // Generate static HTML if requested
             if (this.parser.args.html) {
-                if (Array.isArray(repoInput)) {
-                    // Generate separate HTML files for each repo
-                    const outputDir = process.cwd();
-                    for (const repoPath of repoInput) {
-                        const repoName = path.basename(repoPath);
-                        console.log(`📊 Analyzing ${repoName}...`);
-                        let data = this.cacheManager.load(repoPath);
-                        if (!data) {
-                            const gitView = new GitView(repoPath);
-                            data = gitView.getAllData();
-                            this.cacheManager.save(repoPath, data);
-                        }
-                        const html = HTMLGenerator.generateHTML(data);
-                        const safeName = repoName.replace(/[^a-zA-Z0-9-_]/g, '_');
-                        const outputPath = path.join(outputDir, `gitview-${safeName}.html`);
-                        fs.writeFileSync(outputPath, html, 'utf8');
-                        console.log(`✅ Generated: ${outputPath}`);
-                    }
-                } else {
-                    console.log('📊 Analyzing repository data...');
-                    let data = this.cacheManager.load(repoInput);
-                    if (!data) {
-                        const gitView = new GitView(repoInput);
-                        data = gitView.getAllData();
-                        this.cacheManager.save(repoInput, data);
-                    }
-                    console.log(`✅ Analysis complete: ${data.health.totalCommits} commits, ${data.authors.length} authors`);
+                const reposToAnalyze = Array.isArray(repoInput) ? repoInput : 
+                                     (repoInput.repos || [repoInput]);
+                
+                const outputDir = process.cwd();
+                const repoDataList = [];
+                
+                for (const repoPath of reposToAnalyze) {
+                    const repoName = path.basename(repoPath);
+                    console.log(`📊 Analyzing ${repoName}...`);
                     
-                    console.log('📝 Generating HTML file...');
-                    const html = HTMLGenerator.generateHTML(data);
-                    const outputPath = path.join(process.cwd(), 'gitview.html');
+                    let data = this.cacheManager.load(repoPath);
+                    if (!data) {
+                        const gitView = new GitView(repoPath);
+                        const gitData = gitView.getAllData();
+                        gitData.repository.currentCommit = gitView.executeGitOptional(['rev-parse', 'HEAD']);
+                        
+                        let packAnalysis = null;
+                        try {
+                            const packResult = await analyzeDirectories(repoPath);
+                            packAnalysis = packResult.report || packResult;
+                        } catch (packError) {
+                            console.error(`Pack analysis failed for ${repoName}: ${packError.message}`);
+                        }
+                        
+                        data = {
+                            ...gitData,
+                            packAnalysis: packAnalysis
+                        };
+                        this.cacheManager.save(repoPath, data);
+                    }
+                    
+                    repoDataList.push({
+                        path: repoPath,
+                        name: repoName,
+                        data: data
+                    });
+                    
+                    const html = HTMLGenerator.generateHTML(data, {
+                        repoList: repoDataList.map((r, i) => ({ name: r.name, path: r.path, index: i })),
+                        currentIndex: repoDataList.length - 1,
+                        groups: this.cacheManager.getAllGroups()
+                    });
+                    
+                    const safeName = repoName.replace(/[^a-zA-Z0-9-_]/g, '_');
+                    const outputPath = path.join(outputDir, `gitview-${safeName}.html`);
                     fs.writeFileSync(outputPath, html, 'utf8');
-                    console.log(`✅ HTML generated: ${outputPath}`);
+                    console.log(`✅ Generated: ${outputPath}`);
+                }
+                
+                // Generate comparison HTML if multiple repos
+                if (repoDataList.length > 1) {
+                    const comparisonHTML = HTMLGenerator.generateComparisonHTML(repoDataList, true);
+                    const comparisonPath = path.join(outputDir, 'gitview-comparison.html');
+                    fs.writeFileSync(comparisonPath, comparisonHTML, 'utf8');
+                    console.log(`✅ Generated comparison: ${comparisonPath}`);
                 }
             }
 
@@ -1920,7 +2789,16 @@ class GitViewApp {
 // EXPORTS
 // ============================================================================
 
-export { GitView, GitViewServer, HTMLGenerator, LoadingPageGenerator, ArgumentParser, CacheManager, findGitRepos };
+export { 
+    GitView, 
+    GitViewServer, 
+    HTMLGenerator, 
+    LoadingPageGenerator, 
+    ArgumentParser, 
+    CacheManager, 
+    findGitRepos,
+    analyzeDirectories
+};
 
 // Auto-start if running directly
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -2,7 +2,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { promisify } from 'util';
 import { exec } from 'child_process';
 
@@ -2006,9 +2006,248 @@ async function main() {
   }
 }
 
-process.on('unhandledRejection', (error) => {
-  console.error(`${colors.red}Unhandled rejection: ${error}${colors.reset}`);
-  process.exit(1);
-});
+/* ------------------------------------------------------------------------- */
+/*  NEW: Programmatic API – export default function                           */
+/* ------------------------------------------------------------------------- */
 
-main();
+/**
+ * Resolve and validate directories, returning absolute paths.
+ */
+async function resolveValidDirectories(directories) {
+  const validDirs = [];
+  for (const dir of directories) {
+    const absolutePath = path.resolve(dir);
+    try {
+      const stats = await stat(absolutePath);
+      if (stats.isDirectory()) {
+        validDirs.push(absolutePath);
+      }
+    } catch (error) {
+      // ignore invalid dirs
+    }
+  }
+  return validDirs;
+}
+
+/**
+ * Run all analyzers on a single directory and return the raw report.
+ * This does NOT print anything to the console.
+ */
+async function analyzeSingleDirectoryData(dir) {
+  const absolutePath = path.resolve(dir);
+  
+  // Validate existence
+  try {
+    const stats = await stat(absolutePath);
+    if (!stats.isDirectory()) {
+      throw new Error(`Not a directory: ${absolutePath}`);
+    }
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      throw new Error(`Directory does not exist: ${absolutePath}`);
+    }
+    throw error;
+  }
+  
+  const analyzer = new DirectoryAnalyzer();
+  
+  const sizeAnalyzer = new TotalSizeAnalyzer(IGNORE_DIRS);
+  analyzer.registerAnalyzer(sizeAnalyzer);
+  analyzer.registerAnalyzer(new PackageJsonAnalyzer());
+  analyzer.registerAnalyzer(new LocAnalyzer());
+  analyzer.registerAnalyzer(new ArchiveAnalyzer());
+  analyzer.registerAnalyzer(new BinaryAnalyzer());
+  
+  const gitAnalyzer = new GitAnalyzer();
+  analyzer.registerAnalyzer(gitAnalyzer);
+  
+  analyzer.resetAll();
+  await analyzer.traverseDirectory(absolutePath);
+  
+  await sizeAnalyzer.calculateRealSize(absolutePath);
+  await gitAnalyzer.scanDirectory(absolutePath);
+  
+  return analyzer.getReport();
+}
+
+/**
+ * Run comparison analysis on multiple directories and return data
+ * without printing anything.
+ */
+async function analyzeMultipleDirectoriesData(directories) {
+  const validDirs = await resolveValidDirectories(directories);
+  if (validDirs.length === 0) {
+    throw new Error('No valid directories provided');
+  }
+  
+  const reports = {};
+  const flattenedReports = {};
+  
+  for (const dir of validDirs) {
+    const analyzer = new DirectoryAnalyzer();
+    
+    const sizeAnalyzer = new TotalSizeAnalyzer(IGNORE_DIRS);
+    analyzer.registerAnalyzer(sizeAnalyzer);
+    analyzer.registerAnalyzer(new PackageJsonAnalyzer());
+    analyzer.registerAnalyzer(new LocAnalyzer());
+    analyzer.registerAnalyzer(new ArchiveAnalyzer());
+    analyzer.registerAnalyzer(new BinaryAnalyzer());
+    
+    const gitAnalyzer = new GitAnalyzer();
+    analyzer.registerAnalyzer(gitAnalyzer);
+    
+    analyzer.resetAll();
+    await analyzer.traverseDirectory(dir);
+    
+    await sizeAnalyzer.calculateRealSize(dir);
+    await gitAnalyzer.scanDirectory(dir);
+    
+    const report = analyzer.getReport();
+    reports[dir] = report;
+    
+    flattenedReports[dir] = {
+      ...report['Total Size Analyzer'],
+      'Package.json Analyzer': report['Package.json Analyzer'],
+      'Lines of Code Analyzer': report['Lines of Code Analyzer'],
+      'Archive Files Analyzer': report['Archive Files Analyzer'],
+      'Binary Files Analyzer': report['Binary Files Analyzer'],
+      'Git Analyzer': report['Git Analyzer']
+    };
+  }
+  
+  // Calculate winners (same logic as the CLI)
+  const winners = {};
+  validDirs.forEach(dir => winners[dir] = 0);
+  
+  const dirMetrics = [
+    { label: '💾 REAL Total Size', key: 'realTotalSizeFormatted', winner: 'largest', getValue: (r) => r.realTotalSizeFormatted },
+    { label: 'Total Size (analyzed)', key: 'totalSizeFormatted', winner: 'smallest', getValue: (r) => r.totalSizeFormatted },
+    { label: 'Code Size', key: 'codeSizeFormatted', winner: 'largest', getValue: (r) => r.codeSizeFormatted },
+    { label: 'Binary Size', key: 'binarySizeFormatted', winner: 'smallest', getValue: (r) => r.binarySizeFormatted },
+    { label: 'Archive Size', key: 'archiveSizeFormatted', winner: 'smallest', getValue: (r) => r.archiveSizeFormatted },
+    { label: '.git Size', key: 'gitSizeFormatted', winner: 'smallest', getValue: (r) => r.gitSizeFormatted },
+    { label: '💎 Code Purity', key: 'codePurityRate', winner: 'largest', getValue: (r) => r.codePurityRate },
+    { label: '⚡ Repo Efficiency', key: 'repositoryEfficiencyRate', winner: 'largest', getValue: (r) => r.repositoryEfficiencyRate },
+    { label: 'Files', key: 'fileCount', winner: 'largest', getValue: (r) => r.fileCount.toLocaleString() },
+    { label: 'Directories', key: 'dirCount', winner: 'largest', getValue: (r) => r.dirCount.toLocaleString() }
+  ];
+  
+  const hasPackageJson = validDirs.some(dir => flattenedReports[dir]['Package.json Analyzer'].totalFiles > 0);
+  const hasLoc = validDirs.some(dir => flattenedReports[dir]['Lines of Code Analyzer'].totalLines > 0);
+  const hasArchives = validDirs.some(dir => flattenedReports[dir]['Archive Files Analyzer'].totalCount > 0);
+  const hasBinaries = validDirs.some(dir => flattenedReports[dir]['Binary Files Analyzer'].totalCount > 0);
+  const hasGit = validDirs.some(dir => flattenedReports[dir]['Git Analyzer'].totalRepositories > 0);
+  
+  const allMetrics = [...dirMetrics];
+  if (hasPackageJson) {
+    allMetrics.push(
+      { label: 'package.json', key: 'totalFiles', winner: 'largest' },
+      { label: 'Dependencies', key: 'totalDeps', winner: 'smallest' },
+      { label: 'Purity %', key: 'purityPercentage', winner: 'largest' }
+    );
+  }
+  if (hasLoc) allMetrics.push({ label: 'Total Lines', key: 'totalLines', winner: 'largest' });
+  if (hasArchives) allMetrics.push({ label: 'Archive Files', key: 'totalCount', winner: 'smallest' });
+  if (hasBinaries) allMetrics.push({ label: 'Binary Files', key: 'totalCount', winner: 'smallest' });
+  if (hasGit) {
+    allMetrics.push(
+      { label: 'Git Repos', key: 'totalRepositories', winner: 'largest' },
+      { label: 'Total Commits', key: 'totalCommits', winner: 'largest' },
+      { label: 'Unique Contributors', key: 'totalUniqueContributors', winner: 'largest' }
+    );
+  }
+  
+  allMetrics.forEach(metric => {
+    const values = validDirs.map(dir => {
+      const report = flattenedReports[dir];
+      if (metric.key === 'realTotalSizeFormatted') return parseFloat(report.realTotalSizeMB);
+      if (metric.key === 'totalSizeFormatted') return parseFloat(report.totalSizeMB);
+      if (metric.key === 'codeSizeFormatted') return parseFloat(report.codeSizeMB);
+      if (metric.key === 'binarySizeFormatted') return parseFloat(report.binarySizeMB);
+      if (metric.key === 'archiveSizeFormatted') return parseFloat(report.archiveSizeMB);
+      if (metric.key === 'gitSizeFormatted') return parseFloat(report.gitSizeMB);
+      if (metric.key === 'codePurityRate' || metric.key === 'repositoryEfficiencyRate') {
+        return parseFloat(report[metric.key]) || 0;
+      }
+      if (metric.key === 'fileCount' || metric.key === 'dirCount') return report[metric.key];
+      if (metric.key === 'totalFiles' || metric.key === 'totalDeps' || metric.key === 'purityPercentage') {
+        return parseFloat(report['Package.json Analyzer'][metric.key]) || 0;
+      }
+      if (metric.key === 'totalLines') return report['Lines of Code Analyzer'].totalLines;
+      if (metric.key === 'totalCount') {
+        if (metric.label.includes('Archive')) return report['Archive Files Analyzer'].totalCount;
+        if (metric.label.includes('Binary')) return report['Binary Files Analyzer'].totalCount;
+      }
+      if (metric.key === 'totalRepositories' || metric.key === 'totalCommits' || metric.key === 'totalUniqueContributors') {
+        return report['Git Analyzer'][metric.key] || 0;
+      }
+      return parseFloat(report[metric.key]) || 0;
+    });
+    
+    const winnerValue = metric.winner === 'largest' ? Math.max(...values) : Math.min(...values);
+    const winnerIndex = values.indexOf(winnerValue);
+    if (winnerIndex !== -1) {
+      winners[validDirs[winnerIndex]]++;
+    }
+  });
+  
+  return {
+    directories: validDirs,
+    reports,
+    flattenedReports,
+    winners,
+    hasPackageJson,
+    hasLoc,
+    hasArchives,
+    hasBinaries,
+    hasGit
+  };
+}
+
+/**
+ * Default export – programmatic interface.
+ *
+ * @param {string|string[]} paths - A single directory path or an array of paths.
+ * @returns {Promise<Object>} Analysis result.
+ */
+export default async function analyzeDirectories(paths) {
+  const inputDirs = Array.isArray(paths) ? paths : [paths];
+  if (inputDirs.length === 0) {
+    throw new Error('No directories provided');
+  }
+  
+  const validDirs = await resolveValidDirectories(inputDirs);
+  if (validDirs.length === 0) {
+    throw new Error('No valid directories provided');
+  }
+  
+  if (validDirs.length === 1) {
+    const report = await analyzeSingleDirectoryData(validDirs[0]);
+    return {
+      mode: 'single',
+      path: validDirs[0],
+      report
+    };
+  }
+  
+  const comparison = await analyzeMultipleDirectoriesData(validDirs);
+  return {
+    mode: 'comparison',
+    ...comparison
+  };
+}
+
+/* ------------------------------------------------------------------------- */
+/*  CLI execution guard                                                      */
+/* ------------------------------------------------------------------------- */
+
+const isMain = import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isMain) {
+  process.on('unhandledRejection', (error) => {
+    console.error(`${colors.red}Unhandled rejection: ${error}${colors.reset}`);
+    process.exit(1);
+  });
+
+  main();
+}
