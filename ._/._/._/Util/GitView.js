@@ -118,18 +118,35 @@ class CacheManager {
         return Object.values(groupsData.groups);
     }
 
-    addRepoToGroup(groupName, repoPath) {
+    moveRepoToGroup(groupName, repoPath) {
         const groupsData = this.loadGroups();
-        if (groupsData.groups[groupName]) {
-            const repoAbs = path.resolve(repoPath);
-            if (!groupsData.groups[groupName].repos.includes(repoAbs)) {
-                groupsData.groups[groupName].repos.push(repoAbs);
-                groupsData.groups[groupName].updatedAt = new Date().toISOString();
-                this.saveGroups(groupsData);
-                return true;
+        const repoAbs = path.resolve(repoPath);
+        
+        // Remove from all groups first (move semantics)
+        for (const group of Object.values(groupsData.groups)) {
+            const index = group.repos.indexOf(repoAbs);
+            if (index > -1) {
+                group.repos.splice(index, 1);
+                group.updatedAt = new Date().toISOString();
             }
         }
-        return false;
+        
+        // Add to target group
+        if (!groupsData.groups[groupName]) {
+            groupsData.groups[groupName] = {
+                name: groupName,
+                description: '',
+                repos: [],
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString()
+            };
+        }
+        
+        groupsData.groups[groupName].repos.push(repoAbs);
+        groupsData.groups[groupName].updatedAt = new Date().toISOString();
+        
+        this.saveGroups(groupsData);
+        return true;
     }
 
     removeRepoFromGroup(groupName, repoPath) {
@@ -140,6 +157,12 @@ class CacheManager {
             if (index > -1) {
                 groupsData.groups[groupName].repos.splice(index, 1);
                 groupsData.groups[groupName].updatedAt = new Date().toISOString();
+                
+                // Remove group if empty
+                if (groupsData.groups[groupName].repos.length === 0) {
+                    delete groupsData.groups[groupName];
+                }
+                
                 this.saveGroups(groupsData);
                 return true;
             }
@@ -905,12 +928,6 @@ class GroupAnalyzer {
         aggregatedData.commits.sort((a, b) => new Date(b.authorDate) - new Date(a.authorDate));
         aggregatedData.commits = aggregatedData.commits.slice(0, 500);
 
-        // Aggregate Pack.js data
-        const packInputs = validRepos.map(r => r.path);
-        if (packInputs.length > 0) {
-            // We'll analyze this async in the caller
-        }
-
         return aggregatedData;
     }
 
@@ -1241,7 +1258,7 @@ class LoadingPageGenerator {
 
 class HTMLGenerator {
     static generateHTML(data, options = {}) {
-        const { repoList = [], currentIndex = 0, groups = [], currentGroup = null, comparisonTargets = [] } = options;
+        const { repoList = [], currentIndex = 0, groups = [], currentGroup = null, comparisonTargets = [], ungroupedRepos = [] } = options;
         const hasMultiple = repoList.length > 1;
         const hasGroups = groups.length > 0;
         const monthlyData = data.commitsByMonth;
@@ -1261,6 +1278,9 @@ class HTMLGenerator {
         const packBinaryData = packData?.['Binary Files Analyzer'] || {};
         const packPkgData = packData?.['Package.json Analyzer'] || {};
         const packGitData = packData?.['Git Analyzer'] || {};
+
+        // Get language data for display
+        const languages = packLocData.languages || [];
 
         return `
 <!DOCTYPE html>
@@ -1658,6 +1678,59 @@ class HTMLGenerator {
             font-size: 12px;
         }
 
+        .language-breakdown {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .language-breakdown h2 {
+            color: var(--accent);
+            margin-bottom: 15px;
+        }
+
+        .language-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 10px;
+        }
+
+        .language-item {
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 15px;
+        }
+
+        .language-name {
+            color: var(--accent);
+            font-weight: bold;
+            margin-bottom: 8px;
+        }
+
+        .language-stats {
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+
+        .language-bar {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            height: 8px;
+            margin-top: 8px;
+            overflow: hidden;
+        }
+
+        .language-bar-fill {
+            background: var(--accent);
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s;
+        }
+
         .modal {
             display: none;
             position: fixed;
@@ -1742,6 +1815,36 @@ class HTMLGenerator {
             background: var(--success);
             color: var(--bg-primary);
             border-color: var(--success);
+        }
+
+        .repo-checkbox-list {
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px;
+        }
+
+        .repo-checkbox-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .repo-checkbox-item:last-child {
+            border-bottom: none;
+        }
+
+        .repo-checkbox-item input[type="checkbox"] {
+            width: auto;
+        }
+
+        .repo-checkbox-item label {
+            margin: 0;
+            color: var(--text-primary);
+            cursor: pointer;
         }
 
         @keyframes fadeIn {
@@ -1844,6 +1947,26 @@ class HTMLGenerator {
             </div>
         </div>
 
+        ${languages.length > 0 ? `
+        <div class="language-breakdown fade-in">
+            <h2>📊 Language Breakdown (Lines of Code)</h2>
+            <div class="language-list">
+                ${languages.map(lang => `
+                <div class="language-item">
+                    <div class="language-name">${lang.language} (${lang.percentage}%)</div>
+                    <div class="language-stats">
+                        <div>${lang.lines.toLocaleString()} lines</div>
+                        <div>${lang.files} files</div>
+                    </div>
+                    <div class="language-bar">
+                        <div class="language-bar-fill" style="width: ${lang.percentage}%"></div>
+                    </div>
+                </div>
+                `).join('')}
+            </div>
+        </div>
+        ` : ''}
+
         ${packData ? `
         <div class="pack-info fade-in">
             <h2>📦 Complete Package Analysis (from Pack.js)</h2>
@@ -1897,18 +2020,6 @@ class HTMLGenerator {
                     <p>${packGitData.totalCommits || 'N/A'}</p>
                 </div>
             </div>
-            
-            ${packLocData.languages && packLocData.languages.length > 0 ? `
-            <h3 style="margin-top: 20px; color: var(--accent);">📊 Languages Breakdown</h3>
-            <div class="pack-grid" style="margin-top: 10px;">
-                ${packLocData.languages.slice(0, 10).map(lang => `
-                <div class="pack-item">
-                    <h4>${lang.language} (${lang.percentage}%)</h4>
-                    <p>${lang.lines.toLocaleString()} lines in ${lang.files} files</p>
-                </div>
-                `).join('')}
-            </div>
-            ` : ''}
         </div>
         ` : ''}
 
@@ -2018,7 +2129,6 @@ class HTMLGenerator {
                         <p>${group.description || 'No description'}</p>
                         <p>Repositories: ${group.repos.length}</p>
                         <button class="btn btn-primary" onclick="loadGroup('${group.name}')">Load</button>
-                        <button class="btn btn-success" onclick="addCurrentToGroup('${group.name}')">Add Current</button>
                         <button class="btn btn-danger" onclick="deleteGroup('${group.name}')">Delete</button>
                     </div>
                 `).join('')}
@@ -2041,6 +2151,18 @@ class HTMLGenerator {
             <div class="form-group">
                 <label>Description</label>
                 <textarea id="groupDescription" placeholder="Optional description"></textarea>
+            </div>
+            <div class="form-group">
+                <label>Select repositories to add (moved from ungrouped)</label>
+                <div class="repo-checkbox-list">
+                    ${ungroupedRepos.map(repo => `
+                        <div class="repo-checkbox-item">
+                            <input type="checkbox" id="repo-${repo.index}" value="${repo.path}">
+                            <label for="repo-${repo.index}">${repo.name}</label>
+                        </div>
+                    `).join('')}
+                    ${ungroupedRepos.length === 0 ? '<p style="color: var(--text-secondary);">No ungrouped repositories available</p>' : ''}
+                </div>
             </div>
             <button class="btn btn-primary" onclick="createGroup()">Create Group</button>
         </div>
@@ -2142,27 +2264,6 @@ class HTMLGenerator {
             window.location.href = '/group/' + encodeURIComponent(groupName);
         }
 
-        function addCurrentToGroup(groupName) {
-            const currentRepos = ${JSON.stringify(repoList.map(r => r.path))};
-            fetch('/api/groups/' + encodeURIComponent(groupName) + '/repos', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ repos: currentRepos })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    alert('Added to group!');
-                    location.reload();
-                } else {
-                    alert('Failed to add: ' + data.error);
-                }
-            })
-            .catch(error => {
-                alert('Error adding to group: ' + error.message);
-            });
-        }
-
         function deleteGroup(groupName) {
             if (confirm('Are you sure you want to delete group "' + groupName + '"?')) {
                 fetch('/api/groups/' + encodeURIComponent(groupName), { method: 'DELETE' })
@@ -2189,12 +2290,20 @@ class HTMLGenerator {
                 return;
             }
 
-            const repos = ${JSON.stringify(repoList.map(r => r.path))};
+            const selectedRepos = [];
+            document.querySelectorAll('.repo-checkbox-item input[type="checkbox"]:checked').forEach(checkbox => {
+                selectedRepos.push(checkbox.value);
+            });
             
+            if (selectedRepos.length === 0) {
+                alert('Please select at least one repository');
+                return;
+            }
+
             fetch('/api/groups', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name, description, repos })
+                body: JSON.stringify({ name, description, repos: selectedRepos })
             })
             .then(response => response.json())
             .then(data => {
@@ -2250,11 +2359,19 @@ class HTMLGenerator {
                         fileCount: packData['Total Size Analyzer']?.fileCount || 'N/A',
                         dirCount: packData['Total Size Analyzer']?.dirCount || 'N/A',
                         binaryFiles: packData['Binary Files Analyzer']?.totalCount || 'N/A',
-                        archiveFiles: packData['Archive Files Analyzer']?.totalCount || 'N/A'
+                        archiveFiles: packData['Archive Files Analyzer']?.totalCount || 'N/A',
+                        languages: packData['Lines of Code Analyzer']?.languages || []
                     };
                 }
             });
         }
+
+        // Get all unique languages across repos
+        const allLanguages = new Set();
+        repos.forEach(repo => {
+            const languages = packMetrics[repo.name]?.languages || [];
+            languages.forEach(lang => allLanguages.add(lang.language));
+        });
 
         return `
 <!DOCTYPE html>
@@ -2341,29 +2458,62 @@ class HTMLGenerator {
             background: var(--bg-secondary);
             border: 1px solid var(--border);
             border-radius: 8px;
-            overflow-x: auto;
+            overflow: auto;
             margin-bottom: 20px;
+            max-height: 80vh;
+            position: relative;
         }
 
         table {
             width: 100%;
-            border-collapse: collapse;
+            border-collapse: separate;
+            border-spacing: 0;
         }
 
-        th, td {
-            padding: 12px;
-            text-align: left;
-            border-bottom: 1px solid var(--border);
+        thead {
+            position: sticky;
+            top: 0;
+            z-index: 10;
         }
 
         th {
             background: var(--bg-tertiary);
             color: var(--accent);
             font-weight: bold;
+            padding: 12px;
+            text-align: left;
+            border-bottom: 2px solid var(--border);
+            position: sticky;
+            top: 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
         }
 
-        tr:hover {
+        th:first-child {
+            left: 0;
+            z-index: 11;
+            background: var(--bg-secondary);
+        }
+
+        td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        td:first-child {
+            position: sticky;
+            left: 0;
+            background: var(--bg-secondary);
+            z-index: 5;
+            font-weight: bold;
+        }
+
+        tr:hover td {
             background: var(--bg-tertiary);
+        }
+
+        tr:hover td:first-child {
+            background: var(--bg-secondary);
         }
 
         .winner {
@@ -2371,10 +2521,20 @@ class HTMLGenerator {
             font-weight: bold;
         }
 
-        .section-header {
+        .section-header td {
             background: var(--accent);
             color: var(--bg-primary);
             font-weight: bold;
+            position: sticky;
+            top: 49px;
+            z-index: 9;
+        }
+
+        .section-header td:first-child {
+            background: var(--accent);
+            color: var(--bg-primary);
+            z-index: 12;
+            top: 49px;
         }
     </style>
 </head>
@@ -2468,7 +2628,7 @@ class HTMLGenerator {
                     </tr>
                     <tr>
                         <td>Code Purity Rate</td>
-                        ${repos.map(r => `<td class="${packMetrics[r.name]?.codePurity ? 'winner' : ''}">${packMetrics[r.name]?.codePurity || 'N/A'}</td>`).join('')}
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.codePurity || 'N/A'}</td>`).join('')}
                     </tr>
                     <tr>
                         <td>Repository Efficiency</td>
@@ -2476,7 +2636,7 @@ class HTMLGenerator {
                     </tr>
                     <tr>
                         <td>Total Lines of Code</td>
-                        ${repos.map(r => `<td class="${packMetrics[r.name]?.totalLines === Math.max(...repos.map(x => packMetrics[x.name]?.totalLines ? parseInt(packMetrics[x.name].totalLines.replace(/,/g, '')) : 0)) ? 'winner' : ''}">${packMetrics[r.name]?.totalLines || 'N/A'}</td>`).join('')}
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.totalLines || 'N/A'}</td>`).join('')}
                     </tr>
                     <tr>
                         <td>Unique Contributors (Pack)</td>
@@ -2490,6 +2650,21 @@ class HTMLGenerator {
                         <td>Archive Files</td>
                         ${repos.map(r => `<td>${packMetrics[r.name]?.archiveFiles || 'N/A'}</td>`).join('')}
                     </tr>
+                    ` : ''}
+
+                    ${packComparison && allLanguages.size > 0 ? `
+                    <tr class="section-header">
+                        <td colspan="${repos.length + 1}">Language Lines Breakdown</td>
+                    </tr>
+                    ${Array.from(allLanguages).sort().map(language => `
+                    <tr>
+                        <td>${language}</td>
+                        ${repos.map(r => {
+                            const langData = (packMetrics[r.name]?.languages || []).find(l => l.language === language);
+                            return `<td>${langData ? langData.lines.toLocaleString() + ' lines (' + langData.percentage + '%)' : '-'}</td>`;
+                        }).join('')}
+                    </tr>
+                    `).join('')}
                     ` : ''}
                 </tbody>
             </table>
@@ -2645,12 +2820,23 @@ try {
                     comparisonTargets.push({ type: 'group', name: g.name });
                 });
                 
+                // Get ungrouped repos (not in any group)
+                const groupedRepos = new Set();
+                this.cacheManager.getAllGroups().forEach(g => {
+                    g.repos.forEach(r => groupedRepos.add(r));
+                });
+                
+                const ungroupedRepos = this.repoDataList
+                    .map((r, i) => ({ ...r, index: i }))
+                    .filter(r => !groupedRepos.has(r.path));
+                
                 const options = {
                     repoList: this.repoDataList.map((r, i) => ({ name: r.name, path: r.path, index: i })),
                     currentIndex: repoIndex,
                     groups: this.cacheManager.getAllGroups(),
                     currentGroup: this.currentGroup,
-                    comparisonTargets
+                    comparisonTargets,
+                    ungroupedRepos
                 };
                 const html = HTMLGenerator.generateHTML(repoEntry.data, options);
                 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -2701,7 +2887,7 @@ try {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify(this.cacheManager.getAllGroups(), null, 2));
             }
-            // API: Create group
+            // API: Create group (move selected repos)
             else if (parsedUrl.pathname === '/api/groups' && req.method === 'POST') {
                 let body = '';
                 req.on('data', chunk => { body += chunk; });
@@ -2714,8 +2900,25 @@ try {
                             return;
                         }
                         
-                        const repos = data.repos || this.repoPaths;
-                        this.cacheManager.saveGroup(data.name, repos, data.description || '');
+                        const repos = data.repos || [];
+                        if (repos.length === 0) {
+                            res.writeHead(400, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ success: false, error: 'At least one repository required' }));
+                            return;
+                        }
+                        
+                        // Move each repo to the new group
+                        repos.forEach(repoPath => {
+                            this.cacheManager.moveRepoToGroup(data.name, repoPath);
+                        });
+                        
+                        // Set description if provided
+                        if (data.description) {
+                            const groupData = this.cacheManager.loadGroup(data.name);
+                            if (groupData) {
+                                this.cacheManager.saveGroup(data.name, groupData.repos, data.description);
+                            }
+                        }
                         
                         res.writeHead(200, { 'Content-Type': 'application/json' });
                         res.end(JSON.stringify({ success: true, group: this.cacheManager.loadGroup(data.name) }));
@@ -2725,28 +2928,26 @@ try {
                     }
                 });
             }
-            // API: Add repos to group
-            else if (parsedUrl.pathname.startsWith('/api/groups/') && parsedUrl.pathname.endsWith('/repos') && req.method === 'POST') {
+            // API: Remove repo from group (returns to ungrouped)
+            else if (parsedUrl.pathname.startsWith('/api/groups/') && parsedUrl.pathname.endsWith('/remove-repo') && req.method === 'POST') {
                 const groupName = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
                 let body = '';
                 req.on('data', chunk => { body += chunk; });
                 req.on('end', () => {
                     try {
                         const data = JSON.parse(body);
-                        const repos = data.repos || [];
-                        const groupData = this.cacheManager.loadGroup(groupName);
+                        const repoPath = data.repoPath;
                         
-                        if (!groupData) {
-                            res.writeHead(404, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({ success: false, error: 'Group not found' }));
+                        if (!repoPath) {
+                            res.writeHead(400, { 'Content-Type': 'application/json' });
+                            res.end(JSON.stringify({ success: false, error: 'Repository path required' }));
                             return;
                         }
                         
-                        const mergedRepos = [...new Set([...groupData.repos, ...repos])];
-                        this.cacheManager.saveGroup(groupName, mergedRepos);
+                        const success = this.cacheManager.removeRepoFromGroup(groupName, repoPath);
                         
                         res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ success: true, group: this.cacheManager.loadGroup(groupName) }));
+                        res.end(JSON.stringify({ success, error: success ? null : 'Failed to remove repo from group' }));
                     } catch (error) {
                         res.writeHead(400, { 'Content-Type': 'application/json' });
                         res.end(JSON.stringify({ success: false, error: error.message }));
@@ -3099,8 +3300,12 @@ class GitViewApp {
                     ? findGitRepos(this.parser.args.repoPath) 
                     : [this.parser.args.repoPath];
                 
-                this.cacheManager.saveGroup(groupName, repos);
-                console.log(`✅ Group "${groupName}" created with ${repos.length} repositories`);
+                // Move repos to new group
+                repos.forEach(repo => {
+                    this.cacheManager.moveRepoToGroup(groupName, repo);
+                });
+                
+                console.log(`✅ Group "${groupName}" created with ${repos.length} repositories (moved from ungrouped)`);
                 return;
             }
             
@@ -3110,15 +3315,13 @@ class GitViewApp {
                     ? findGitRepos(this.parser.args.repoPath) 
                     : [this.parser.args.repoPath];
                 
-                const existingGroup = this.cacheManager.loadGroup(groupName);
-                if (existingGroup) {
-                    const mergedRepos = [...new Set([...existingGroup.repos, ...repos])];
-                    this.cacheManager.saveGroup(groupName, mergedRepos);
-                    console.log(`✅ Added ${repos.length} repositories to group "${groupName}" (${mergedRepos.length} total)`);
-                } else {
-                    this.cacheManager.saveGroup(groupName, repos);
-                    console.log(`✅ Group "${groupName}" created with ${repos.length} repositories`);
-                }
+                // Move repos to existing group
+                repos.forEach(repo => {
+                    this.cacheManager.moveRepoToGroup(groupName, repo);
+                });
+                
+                const groupData = this.cacheManager.loadGroup(groupName);
+                console.log(`✅ Moved ${repos.length} repositories to group "${groupName}" (${groupData.repos.length} total)`);
                 return;
             }
             
@@ -3135,13 +3338,24 @@ class GitViewApp {
                     repos: groupData.repos
                 };
             } else if (this.parser.args.dir) {
-                const repos = findGitRepos(this.parser.args.repoPath);
-                if (repos.length === 0) {
+                const allRepos = findGitRepos(this.parser.args.repoPath);
+                if (allRepos.length === 0) {
                     console.error(`❌ No .git repositories found in ${this.parser.args.repoPath}`);
                     process.exit(1);
                 }
-                console.log(`📁 Found ${repos.length} repositories in ${this.parser.args.repoPath}`);
-                repoInput = repos;
+                
+                // Get repos that are not in any group (ungrouped)
+                const groupedRepos = new Set();
+                this.cacheManager.getAllGroups().forEach(g => {
+                    g.repos.forEach(r => groupedRepos.add(r));
+                });
+                
+                const ungroupedRepos = allRepos.filter(repo => !groupedRepos.has(repo));
+                
+                console.log(`📁 Found ${allRepos.length} repositories in ${this.parser.args.repoPath}`);
+                console.log(`📦 ${ungroupedRepos.length} ungrouped repositories will be shown`);
+                
+                repoInput = ungroupedRepos;
             } else {
                 repoInput = this.parser.args.repoPath;
             }
@@ -3188,7 +3402,8 @@ class GitViewApp {
                     const html = HTMLGenerator.generateHTML(data, {
                         repoList: repoDataList.map((r, i) => ({ name: r.name, path: r.path, index: i })),
                         currentIndex: repoDataList.length - 1,
-                        groups: this.cacheManager.getAllGroups()
+                        groups: this.cacheManager.getAllGroups(),
+                        ungroupedRepos: repoDataList.map((r, i) => ({ ...r, index: i }))
                     });
                     
                     const safeName = repoName.replace(/[^a-zA-Z0-9-_]/g, '_');
