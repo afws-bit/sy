@@ -1,4 +1,4 @@
-// bundle.js - FINAL VERSION WITH COMPLETE CIRCULAR DEPENDENCY FIX + PRECISE STATIC PROPERTY MATCHING
+// bundle.js - FINAL WORKING VERSION
 import { readFileSync, writeFileSync, statSync } from 'fs';
 import { resolve, dirname, extname, relative } from 'path';
 import { fileURLToPath } from 'url';
@@ -62,7 +62,6 @@ class ModuleBundler {
   parseImportStatement(statement) {
     const normalized = statement.replace(/\s+/g, ' ').trim();
     let match;
-    // side-effect import
     match = normalized.match(/^import\s+['"]([^'"]+)['"]\s*;?$/);
     if (match) {
       return {
@@ -74,7 +73,6 @@ class ModuleBundler {
         namespaceImport: null,
       };
     }
-    // default import
     match = normalized.match(/^import\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?$/);
     if (match) {
       return {
@@ -86,7 +84,6 @@ class ModuleBundler {
         namespaceImport: null,
       };
     }
-    // named imports
     match = normalized.match(/^import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?$/);
     if (match) {
       const names = match[1].split(',').map(n => {
@@ -102,7 +99,6 @@ class ModuleBundler {
         namespaceImport: null,
       };
     }
-    // namespace import
     match = normalized.match(/^import\s+\*\s+as\s+(\w+)\s+from\s+['"]([^'"]+)['"]\s*;?$/);
     if (match) {
       return {
@@ -114,7 +110,6 @@ class ModuleBundler {
         namespaceImport: match[1],
       };
     }
-    // combined default + named
     match = normalized.match(/^import\s+(\w+)\s*,\s*\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]\s*;?$/);
     if (match) {
       const names = match[2].split(',').map(n => {
@@ -140,7 +135,6 @@ class ModuleBundler {
       hasDefault: false,
       defaultExpression: null,
     };
-    // Support `export default async function`
     const defaultFuncMatch = content.match(/export\s+default\s+(?:async\s+)?function\s+(\w+)/);
     const defaultClassMatch = content.match(/export\s+default\s+class\s+(\w+)/);
     const defaultExprMatch = content.match(/export\s+default\s+([^;\n]+)/);
@@ -159,7 +153,6 @@ class ModuleBundler {
         exports.defaultExport = expr;
       }
     }
-    // Include `async function` in named export matching
     const namedRegex = /export\s+(?:const|let|var|class|async\s+function|function)\s+(\w+)/g;
     let match;
     while ((match = namedRegex.exec(content)) !== null) {
@@ -180,11 +173,8 @@ class ModuleBundler {
       cleaned = cleaned.slice(0, imp.position) + cleaned.slice(imp.endPosition);
     }
     cleaned = cleaned.replace(/^#!.*\n/, '');
-    // Strip `export default async function` before the generic default function regex
     cleaned = cleaned.replace(/export\s+default\s+async\s+function\s+(\w+)/g, 'async function $1');
-    // Strip `export async function` before the generic export regex
     cleaned = cleaned.replace(/export\s+async\s+function\s+(\w+)/g, 'async function $1');
-    // Existing default and named export stripping (unchanged)
     cleaned = cleaned.replace(/export\s+default\s+function\s+(\w+)/g, 'function $1');
     cleaned = cleaned.replace(/export\s+default\s+class\s+(\w+)/g, 'class $1');
     cleaned = cleaned.replace(/export\s+default\s+/g, 'var _defaultExport = ');
@@ -273,8 +263,16 @@ class ModuleBundler {
   }
 
   /**
+   * NO TRANSFORMATION - Keep await as-is
+   * The await will be handled by wrapping the module execution in an async function
+   */
+  transformTopLevelAwait(content, isEntry) {
+    // Don't modify the content at all
+    return content;
+  }
+
+  /**
    * COMPREHENSIVE main-check transformation.
-   * Catches ALL known patterns including Qemu's specific pattern.
    */
   transformMainCheck(content, isEntry) {
     let transformed = content;
@@ -331,7 +329,13 @@ class ModuleBundler {
           : `if (false) { // was: ${match.trim()}`
       },
       {
-        regex: /if\s*\(\s*\!\s*module\.parent\s*\)\s*\{/g,
+        regex: /if\s*\(\s*import\.meta\.url\s*===?\s*`file:\/\/\$\{process\.argv\[1\]\}`\s*\)\s*\{/g,
+        replacement: (match) => isEntry 
+          ? `if (true) { // was: ${match.trim()}`
+          : `if (false) { // was: ${match.trim()}`
+      },
+      {
+        regex: /if\s*\(\s*!\s*module\.parent\s*\)\s*\{/g,
         replacement: (match) => isEntry 
           ? `if (true) { // was: ${match.trim()}`
           : `if (false) { // was: ${match.trim()}`
@@ -351,11 +355,6 @@ class ModuleBundler {
         const fullMatch = match[0];
         const newCode = replacement(fullMatch);
         
-        if (this.debug) {
-          const lineNum = transformed.slice(0, match.index).split('\n').length;
-          console.log(`     📝 Line ${lineNum}: ${fullMatch.trim().substring(0, 60)}... → ${isEntry ? 'ENABLED' : 'DISABLED'}`);
-        }
-        
         transformed = transformed.slice(0, match.index) + newCode + transformed.slice(match.index + fullMatch.length);
         regex.lastIndex = match.index + newCode.length;
         replaced = true;
@@ -363,19 +362,13 @@ class ModuleBundler {
       }
     }
 
-    if (this.debug && replaced) {
-      console.log(`   🔧 Main-check ${isEntry ? 'ENABLED (entry)' : 'DISABLED'} - ${matchCount} occurrence(s) modified`);
-    }
-    
     return transformed;
   }
 
   /**
    * Transform circular dependencies through lazy loading.
-   * This is the main entry point for handling circular dependency issues.
    */
   transformCircularDependencies(content, imports, currentFilePath) {
-    // Build a map of imported identifiers to their source module info
     const importInfoMap = new Map();
     
     for (const imp of imports) {
@@ -385,12 +378,9 @@ class ModuleBundler {
       const depModule = this.moduleRegistry.get(depPath);
       if (!depModule || depModule.isNative) continue;
 
-      // Check if this is a circular dependency
       const isCircular = this.isCircularDependency(currentFilePath, depPath);
-      
       const depId = depModule.id;
 
-      // Default import
       if (imp.defaultImport) {
         importInfoMap.set(imp.defaultImport, {
           depId,
@@ -400,7 +390,6 @@ class ModuleBundler {
         });
       }
 
-      // Named imports (including those from combined imports)
       if (imp.namedImports && imp.namedImports.length > 0) {
         for (const named of imp.namedImports) {
           const localName = named.alias || named.original;
@@ -413,7 +402,6 @@ class ModuleBundler {
         }
       }
 
-      // Namespace import
       if (imp.namespaceImport) {
         importInfoMap.set(imp.namespaceImport, {
           depId,
@@ -424,24 +412,16 @@ class ModuleBundler {
       }
     }
 
-    // Transform static property assignments
     content = this.transformStaticProperties(content, importInfoMap);
-    
-    // Transform constructor references in circular dependencies
     content = this.transformConstructorReferences(content, importInfoMap);
 
     return content;
   }
 
   /**
-   * Transform static property assignments that reference imported modules
-   * into lazy getters to break circular dependencies.
-   * FIXED: More precise regex to avoid matching method calls
+   * Transform static property assignments.
    */
   transformStaticProperties(content, importInfoMap) {
-    // More precise regex: matches only simple static assignments, not method calls
-    // Pattern: static PropertyName = Identifier; (with optional semicolon)
-    // Uses negative lookahead to avoid matching when followed by . or (
     const staticAssignRegex = /static\s+(\w+)\s*=\s*([A-Za-z_$][\w$]*)\s*(?=[;\n]|$)/g;
     const replacements = [];
     let match;
@@ -451,12 +431,8 @@ class ModuleBundler {
       const info = importInfoMap.get(importedIdent);
       if (!info) continue;
 
-      // Double-check: ensure this is really a static property assignment
-      // and not part of a larger expression
-      const beforeMatch = content.slice(Math.max(0, match.index - 20), match.index);
       const afterMatch = content.slice(match.index + full.length, match.index + full.length + 20);
       
-      // Skip if this appears to be part of a method chain or call
       if (afterMatch.trimStart().startsWith('.') || afterMatch.trimStart().startsWith('(')) {
         continue;
       }
@@ -466,7 +442,7 @@ class ModuleBundler {
         requireExpr = `__require('${info.depId}')`;
       } else if (info.type === 'default') {
         requireExpr = `__require('${info.depId}').default`;
-      } else { // named
+      } else {
         requireExpr = `__require('${info.depId}').${info.accessor}`;
       }
 
@@ -476,19 +452,11 @@ class ModuleBundler {
         start: match.index,
         end: match.index + full.length,
         replacement: getter,
-        propName,
-        importedIdent
       });
-
-      if (this.debug) {
-        const lineNum = content.slice(0, match.index).split('\n').length;
-        console.log(`     🔄 Static property: ${propName} = ${importedIdent} → lazy getter (line ${lineNum})`);
-      }
     }
 
     if (replacements.length === 0) return content;
 
-    // Apply replacements from end to start to avoid shifting indices
     let result = content;
     for (const replacement of replacements.sort((a, b) => b.start - a.start)) {
       result = result.slice(0, replacement.start) + replacement.replacement + result.slice(replacement.end);
@@ -498,11 +466,9 @@ class ModuleBundler {
   }
 
   /**
-   * Transform constructor references in circular dependencies
-   * to use lazy loading.
+   * Transform constructor references.
    */
   transformConstructorReferences(content, importInfoMap) {
-    // Find patterns like: new EasyAI(...) where EasyAI is a circular import
     const constructorRegex = /new\s+([A-Za-z_$][\w$]*)\s*\(/g;
     const replacements = [];
     let match;
@@ -511,7 +477,6 @@ class ModuleBundler {
       const [full, constructorName] = match;
       const info = importInfoMap.get(constructorName);
       
-      // Only transform if this is a circular dependency
       if (!info || !info.isCircular) continue;
 
       let requireExpr;
@@ -520,7 +485,7 @@ class ModuleBundler {
       } else if (info.type === 'named') {
         requireExpr = `__require('${info.depId}').${info.accessor}`;
       } else {
-        continue; // Skip namespace imports for constructor references
+        continue;
       }
 
       const lazyConstructor = `new (${requireExpr})(`;
@@ -529,18 +494,11 @@ class ModuleBundler {
         start: match.index,
         end: match.index + full.length,
         replacement: lazyConstructor,
-        constructorName
       });
-
-      if (this.debug) {
-        const lineNum = content.slice(0, match.index).split('\n').length;
-        console.log(`     🔄 Constructor: new ${constructorName}(...) → lazy loading (line ${lineNum})`);
-      }
     }
 
     if (replacements.length === 0) return content;
 
-    // Apply replacements from end to start to avoid shifting indices
     let result = content;
     for (const replacement of replacements.sort((a, b) => b.start - a.start)) {
       result = result.slice(0, replacement.start) + replacement.replacement + result.slice(replacement.end);
@@ -550,16 +508,14 @@ class ModuleBundler {
   }
 
   /**
-   * Detect if two modules have a circular dependency.
+   * Detect circular dependencies.
    */
   isCircularDependency(moduleA, moduleB) {
-    // Simple check: if moduleA imports moduleB and moduleB imports moduleA
     const moduleAInfo = this.moduleRegistry.get(moduleA);
     const moduleBInfo = this.moduleRegistry.get(moduleB);
     
     if (!moduleAInfo || !moduleBInfo) return false;
     
-    // Check if B imports A
     const bImportsA = moduleBInfo.imports.some(imp => {
       if (imp.isNative) return false;
       const resolvedPath = this.resolveModulePath(imp.modulePath, moduleB);
@@ -594,9 +550,11 @@ class ModuleBundler {
       const exports = this.parseExports(originalContent);
       let cleanedContent = this.stripAllModuleSyntax(originalContent, imports);
 
-      // Apply main‑check transformation
       const isEntry = (filePath === this.entryFile);
       cleanedContent = this.transformMainCheck(cleanedContent, isEntry);
+      
+      // No await transformation - keep as-is
+      cleanedContent = this.transformTopLevelAwait(cleanedContent, isEntry);
 
       const moduleId = `module_${this.moduleCounter++}`;
 
@@ -614,20 +572,6 @@ class ModuleBundler {
       this.moduleRegistry.set(filePath, moduleInfo);
       this.processedModules.set(filePath, moduleInfo);
 
-      if (this.debug) {
-        console.log(`📄 Processed: ${moduleInfo.relativePath}`);
-        if (imports.length > 0) {
-          console.log(`   Imports: ${imports.map(i => i.modulePath).join(', ')}`);
-        }
-        if (exports.hasDefault || exports.namedExports.size > 0) {
-          const expList = [];
-          if (exports.hasDefault) expList.push('default');
-          expList.push(...exports.namedExports);
-          console.log(`   Exports: ${expList.join(', ')}`);
-        }
-      }
-
-      // Process dependencies first (so their module IDs are known)
       for (const imp of imports) {
         if (!imp.isNative) {
           const resolvedPath = this.resolveModulePath(imp.modulePath, filePath);
@@ -635,7 +579,6 @@ class ModuleBundler {
         }
       }
 
-      // Now that dependencies are registered, transform circular dependencies
       cleanedContent = this.transformCircularDependencies(cleanedContent, imports, filePath);
       moduleInfo.content = cleanedContent;
 
@@ -646,7 +589,7 @@ class ModuleBundler {
     }
   }
 
-  // --- Bundle generation (with circular dependency fix) ---
+  // --- Bundle generation ---
   generateBundle() {
     let output = '';
     const modules = Array.from(this.processedModules.values());
@@ -666,6 +609,7 @@ class ModuleBundler {
       }
     }
 
+    // Use CommonJS for the entire bundle
     output += "import { createRequire } from 'module';\n";
     output += "const __nativeRequire = createRequire(import.meta.url);\n\n";
     output += 'const __modules = {};\n';
@@ -694,7 +638,11 @@ class ModuleBundler {
         output += '\n';
       }
 
-      output += `__modules['${module.id}'] = function(exports) {\n`;
+      // Make the module function async if it's the entry module
+      const isEntryModule = (module.id === entryModule.id);
+      const functionKeyword = isEntryModule ? 'async function' : 'function';
+      
+      output += `__modules['${module.id}'] = ${functionKeyword}(exports) {\n`;
       output += `  exports = exports || {};\n`;
       output += `  var module = { exports: exports };\n\n`;
 
@@ -724,27 +672,24 @@ class ModuleBundler {
           const depPath = this.resolveModulePath(imp.modulePath, module.path);
           const depModule = this.moduleRegistry.get(depPath);
           if (depModule && !depModule.isNative) {
-            // Check if this is a circular dependency
             const isCircular = this.isCircularDependency(module.path, depPath);
             
             if (imp.type === 'default') {
               if (isCircular) {
-                // For circular dependencies, use lazy loading with Proxy
                 output += `  var ${imp.defaultImport} = new Proxy({}, { get: (_, prop) => { const mod = __require('${depModule.id}'); return prop === 'default' ? mod.default : mod[prop]; } });\n`;
               } else {
                 output += `  var ${imp.defaultImport} = __require('${depModule.id}').default;\n`;
               }
             } else if (imp.type === 'named') {
-              const names = imp.namedImports.map(n =>
-                n.original !== n.alias ? `${n.original}: ${n.alias}` : n.original
-              ).join(', ');
               if (isCircular) {
-                // For circular dependencies, use lazy loading for each named import
                 for (const named of imp.namedImports) {
                   const localName = named.alias || named.original;
                   output += `  var ${localName} = undefined; Object.defineProperty(this, '${localName}', { get: () => __require('${depModule.id}').${named.original} });\n`;
                 }
               } else {
+                const names = imp.namedImports.map(n =>
+                  n.original !== n.alias ? `${n.original}: ${n.alias}` : n.original
+                ).join(', ');
                 output += `  var { ${names} } = __require('${depModule.id}');\n`;
               }
             } else if (imp.type === 'namespace') {
@@ -802,12 +747,22 @@ class ModuleBundler {
     if (entryModule) {
       const namedExports = Array.from(entryModule.exports.namedExports).filter(n => n !== 'default');
       output += `// ========================================\n`;
-      output += `// Entry module execution\n`;
+      output += `// Entry module execution (async)\n`;
       output += `// ========================================\n`;
-      output += `const __entry = __require('${entryModule.id}');\n`;
-      output += `export default __entry.default;\n`;
+      
+      // Execute the entry module asynchronously
+      output += `(async () => {\n`;
+      output += `  const __entry = await __require('${entryModule.id}');\n`;
+      output += `  globalThis.__entry = __entry;\n`;
+      output += `})().catch(error => {\n`;
+      output += `  console.error('Failed to initialize:', error);\n`;
+      output += `  process.exit(1);\n`;
+      output += `});\n`;
+      
+      // Export the entry module (will be available after async execution)
+      output += `export default (await __require('${entryModule.id}')).default;\n`;
       if (namedExports.length > 0) {
-        output += `export const { ${namedExports.join(', ')} } = __entry;\n`;
+        output += `export const { ${namedExports.join(', ')} } = await __require('${entryModule.id}');\n`;
       }
     }
 
@@ -836,15 +791,6 @@ class ModuleBundler {
     }
     if (nativeMods.size > 0) {
       console.log(`🔧 Native modules: ${Array.from(nativeMods).join(', ')}`);
-    }
-
-    if (this.debug) {
-      console.log('\n🔍 Debug summary:');
-      console.log('   Entry file:', this.entryFile);
-      console.log('   Processed modules:');
-      for (const [path, info] of this.processedModules) {
-        console.log(`     - ${info.relativePath}`);
-      }
     }
 
     return bundledContent;
