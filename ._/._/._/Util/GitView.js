@@ -901,9 +901,14 @@ class HTMLGenerator {
         const hasMultiple = repoList.length > 1;
         const monthlyData = data.commitsByMonth;
         const yearlyData = data.yearlySummary;
-        const maxMonthlyCommits = Math.max(...Object.values(monthlyData).map(d => d.commitCount), 1);
-        const maxYearlyCommits = Math.max(...Object.values(yearlyData).map(d => d.commitCount), 1);
-        
+
+        // Sort keys chronologically (ascending: oldest to newest)
+        const monthlyKeys = Object.keys(monthlyData).sort();
+        const yearlyKeys = Object.keys(yearlyData).sort();
+
+        const maxMonthlyCommits = Math.max(...monthlyKeys.map(key => monthlyData[key].commitCount), 1);
+        const maxYearlyCommits = Math.max(...yearlyKeys.map(key => yearlyData[key].commitCount), 1);
+
         return `
 <!DOCTYPE html>
 <html lang="en">
@@ -1083,7 +1088,8 @@ class HTMLGenerator {
 
         .chart {
             position: relative;
-            overflow: hidden;
+            /* Remove overflow: hidden to allow tooltip to appear outside */
+            overflow: visible;
         }
 
         .chart-bars {
@@ -1322,42 +1328,46 @@ class HTMLGenerator {
                 <h2 class="chart-title">📈 Commit Activity</h2>
                 <div class="view-toggle">
                     <button class="toggle-btn active" onclick="switchView('month')">Monthly</button>
-                    ${Object.keys(yearlyData).length > 1 ? '<button class="toggle-btn" onclick="switchView(\'year\')">Yearly</button>' : ''}
+                    ${yearlyKeys.length > 1 ? '<button class="toggle-btn" onclick="switchView(\'year\')">Yearly</button>' : ''}
                 </div>
             </div>
             <div class="chart" id="commitChart">
                 <div class="chart-bars" id="monthlyBars">
-                    ${Object.entries(monthlyData).map(([key, data]) => `
+                    ${monthlyKeys.map(key => {
+                        const dataPoint = monthlyData[key];
+                        return `
                         <div class="chart-bar month-view" 
-                             style="height: ${Math.max(5, (data.commitCount / maxMonthlyCommits) * 250)}px"
+                             style="height: ${Math.max(5, (dataPoint.commitCount / maxMonthlyCommits) * 250)}px"
                              data-period="${key}"
-                             data-commits="${data.commitCount}"
-                             data-authors="${data.authorsCount}"
-                             data-insertions="${data.insertions}"
-                             data-deletions="${data.deletions}"
+                             data-commits="${dataPoint.commitCount}"
+                             data-authors="${dataPoint.authorsCount}"
+                             data-insertions="${dataPoint.insertions}"
+                             data-deletions="${dataPoint.deletions}"
                              onmouseenter="showTooltip(event, this)"
                              onmouseleave="hideTooltip()">
-                            <div class="chart-bar-value">${data.commitCount}</div>
+                            <div class="chart-bar-value">${dataPoint.commitCount}</div>
                             <div class="chart-bar-label">${key}</div>
-                        </div>
-                    `).join('')}
+                        </div>`;
+                    }).join('')}
                 </div>
-                ${Object.keys(yearlyData).length > 1 ? `
+                ${yearlyKeys.length > 1 ? `
                 <div class="chart-bars" id="yearlyBars" style="display: none;">
-                    ${Object.entries(yearlyData).map(([year, data]) => `
+                    ${yearlyKeys.map(year => {
+                        const dataPoint = yearlyData[year];
+                        return `
                         <div class="chart-bar year-view" 
-                             style="height: ${Math.max(5, (data.commitCount / maxYearlyCommits) * 250)}px"
+                             style="height: ${Math.max(5, (dataPoint.commitCount / maxYearlyCommits) * 250)}px"
                              data-period="${year}"
-                             data-commits="${data.commitCount}"
-                             data-authors="${data.authorsCount}"
-                             data-insertions="${data.insertions}"
-                             data-deletions="${data.deletions}"
+                             data-commits="${dataPoint.commitCount}"
+                             data-authors="${dataPoint.authorsCount}"
+                             data-insertions="${dataPoint.insertions}"
+                             data-deletions="${dataPoint.deletions}"
                              onmouseenter="showTooltip(event, this)"
                              onmouseleave="hideTooltip()">
-                            <div class="chart-bar-value">${data.commitCount}</div>
+                            <div class="chart-bar-value">${dataPoint.commitCount}</div>
                             <div class="chart-bar-label">${year}</div>
-                        </div>
-                    `).join('')}
+                        </div>`;
+                    }).join('')}
                 </div>
                 ` : ''}
                 <div class="tooltip" id="tooltip">
@@ -1424,19 +1434,34 @@ class HTMLGenerator {
 
         function showTooltip(event, element) {
             const tooltip = document.getElementById('tooltip');
-            const rect = element.getBoundingClientRect();
-            const chartRect = element.closest('.chart').getBoundingClientRect();
+            const chart = document.getElementById('commitChart');
+            const chartRect = chart.getBoundingClientRect();
+            const barRect = element.getBoundingClientRect();
             
-            tooltip.style.left = (rect.left - chartRect.left + rect.width / 2 - 100) + 'px';
-            tooltip.style.top = (rect.top - chartRect.top - 120) + 'px';
-            
+            // Set tooltip content
             document.getElementById('tooltipTitle').textContent = element.dataset.period;
             document.getElementById('tooltipCommits').textContent = element.dataset.commits;
             document.getElementById('tooltipAuthors').textContent = element.dataset.authors;
             document.getElementById('tooltipInsertions').textContent = '+' + element.dataset.insertions;
             document.getElementById('tooltipDeletions').textContent = '-' + element.dataset.deletions;
             
+            // Make tooltip visible first to measure its dimensions
             tooltip.classList.add('visible');
+            const tooltipWidth = tooltip.offsetWidth;
+            const tooltipHeight = tooltip.offsetHeight;
+            
+            // Horizontal positioning: center of bar, clamped to chart bounds
+            let left = barRect.left - chartRect.left + barRect.width / 2 - tooltipWidth / 2;
+            left = Math.max(0, Math.min(left, chartRect.width - tooltipWidth));
+            
+            // Vertical positioning: above bar if enough space, otherwise below
+            let top = barRect.top - chartRect.top - tooltipHeight - 10;
+            if (top < 0) {
+                top = barRect.bottom - chartRect.top + 10;
+            }
+            
+            tooltip.style.left = left + 'px';
+            tooltip.style.top = top + 'px';
         }
 
         function hideTooltip() {
