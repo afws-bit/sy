@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import process from 'process';
+import os from 'os';
 
 // ============================================================
 //  ANSI escape codes for terminal control
@@ -59,18 +60,23 @@ async function generateStruct(filePaths, outputFileName = 'struct') {
 }
 
 // ============================================================
-//  Save absolute paths to a file (one per line)
+//  Save absolute paths to a file (one per line) in /tmp
 // ============================================================
 async function savePaths(filePaths, saveName) {
-    await fs.writeFile(saveName, filePaths.join('\n'), 'utf8');
-    console.log(`Paths saved to: ${path.resolve(saveName)}`);
+    const tmpDir = os.tmpdir();
+    const savePath = path.join(tmpDir, saveName);
+    await fs.writeFile(savePath, filePaths.join('\n'), 'utf8');
+    console.log(`Paths saved to: ${savePath}`);
+    return savePath;
 }
 
 // ============================================================
-//  Load absolute paths from a savename file
+//  Load absolute paths from a savename file in /tmp
 // ============================================================
 async function loadPaths(saveName) {
-    const data = await fs.readFile(saveName, 'utf8');
+    const tmpDir = os.tmpdir();
+    const savePath = path.join(tmpDir, saveName);
+    const data = await fs.readFile(savePath, 'utf8');
     return data.split('\n')
         .map(line => line.trim())
         .filter(line => line.length > 0);
@@ -96,7 +102,7 @@ async function interactiveMode() {
         console.log(`${BOLD}${BLUE}Current directory:${RESET} ${YELLOW}${currentDir}${RESET}`);
         console.log(`${BOLD}Selected: ${selectedFiles.size} file(s)${RESET}`);
         console.log('─'.repeat(process.stdout.columns || 80));
-        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, Enter open dir, Space select file, g generate, b back, q quit`);
+        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, Enter open dir/select file, Space select file, g generate, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
 
         entries.forEach((entry, idx) => {
@@ -148,7 +154,7 @@ async function interactiveMode() {
             return;
         }
 
-        // Enter: navigate into directory or do nothing
+        // Enter: navigate into directory or toggle selection for files
         if (key === '\r' || key === '\n') {
             if (entries.length > 0 && cursorIndex >= 0 && cursorIndex < entries.length) {
                 const entry = entries[cursorIndex];
@@ -156,6 +162,14 @@ async function interactiveMode() {
                     currentDir = path.join(currentDir, entry.name);
                     entries = await readDirectory(currentDir);
                     cursorIndex = 0;
+                } else {
+                    // Toggle file selection with Enter
+                    const fullPath = path.join(currentDir, entry.name);
+                    if (selectedFiles.has(fullPath)) {
+                        selectedFiles.delete(fullPath);
+                    } else {
+                        selectedFiles.add(fullPath);
+                    }
                 }
             }
             render();
@@ -227,7 +241,7 @@ async function main() {
     const args = process.argv.slice(2);
 
     if (args.length > 0) {
-        // Regeneration mode: load saved paths and generate struct
+        // Regeneration mode: load saved paths from /tmp and generate struct
         const saveName = args[0];
         try {
             const paths = await loadPaths(saveName);
