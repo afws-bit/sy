@@ -1053,7 +1053,7 @@ class BinaryAnalyzer extends BaseAnalyzer {
 
 /**
  * Analyzer for Git repositories to get contributors and commits
- * FIX: Now handles similar emails and excludes generic emails
+ * IMPROVED: Now calculates average pure code added per commit
  */
 class GitAnalyzer extends BaseAnalyzer {
   constructor() {
@@ -1100,6 +1100,168 @@ class GitAnalyzer extends BaseAnalyzer {
     return gitRepos;
   }
 
+  /**
+   * Get the total pure code added (in bytes) across all commits
+   * Pure code means only files with known code extensions and excludes binary/archive files
+   */
+  async getTotalPureCodeAdded(repoPath) {
+    try {
+      // Get list of all commits with their stats
+      // Using --numstat gives us added/deleted lines per file
+      const { stdout: numstatOutput } = await execPromise('git log --numstat --format="COMMIT:%H"', {
+        cwd: repoPath,
+        encoding: 'utf8',
+        maxBuffer: 50 * 1024 * 1024
+      });
+      
+      let totalPureCodeAddedBytes = 0;
+      let commitHash = null;
+      
+      const lines = numstatOutput.split('\n');
+      
+      for (const line of lines) {
+        if (line.startsWith('COMMIT:')) {
+          commitHash = line.substring(7);
+          continue;
+        }
+        
+        if (!line.trim() || !commitHash) continue;
+        
+        const parts = line.split('\t');
+        if (parts.length < 3) continue;
+        
+        const addedLines = parts[0];
+        const deletedLines = parts[1];
+        const filename = parts[2];
+        
+        // Skip binary files (shown as '-' in numstat)
+        if (addedLines === '-' || deletedLines === '-') {
+          continue;
+        }
+        
+        // Only count pure code files (not binary, not archive)
+        if (isArchiveFile(filename)) {
+          continue;
+        }
+        
+        // Check if it's a code file by extension
+        const language = detectFileLanguage(filename);
+        if (!language) {
+          continue;
+        }
+        
+        // Calculate bytes: use average bytes per line (rough estimate)
+        // This is an approximation since we can't easily get exact byte counts
+        // without checking out each commit
+        const addedLineCount = parseInt(addedLines, 10) || 0;
+        const deletedLineCount = parseInt(deletedLines, 10) || 0;
+        
+        // Net pure code added (positive means net addition)
+        const netAddedLines = Math.max(0, addedLineCount - deletedLineCount);
+        
+        // Estimate bytes: average line is about 40-50 bytes including newline
+        // Use 45 as a reasonable average for code files
+        const estimatedBytes = netAddedLines * 45;
+        
+        totalPureCodeAddedBytes += estimatedBytes;
+      }
+      
+      return totalPureCodeAddedBytes;
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  /**
+   * Alternative method: Get total pure code added using diff stats
+   * This is more accurate as it uses actual byte counts
+   */
+  async getTotalPureCodeAddedAccurate(repoPath) {
+    try {
+      // Get all commits
+      const { stdout: commitList } = await execPromise('git rev-list --all', {
+        cwd: repoPath,
+        encoding: 'utf8'
+      });
+      
+      const commits = commitList.split('\n').filter(c => c.trim());
+      
+      if (commits.length === 0) {
+        return 0;
+      }
+      
+      let totalPureCodeAddedBytes = 0;
+      
+      // Process commits in batches for efficiency
+      const batchSize = 100;
+      for (let i = 0; i < commits.length; i += batchSize) {
+        const batch = commits.slice(i, i + batchSize);
+        
+        for (const commit of batch) {
+          try {
+            // Get diff stats for this commit
+            const { stdout: diffStats } = await execPromise(`git show --numstat --format="" ${commit}`, {
+              cwd: repoPath,
+              encoding: 'utf8',
+              maxBuffer: 10 * 1024 * 1024
+            });
+            
+            const lines = diffStats.split('\n');
+            
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              
+              const parts = line.split('\t');
+              if (parts.length < 3) continue;
+              
+              const added = parts[0];
+              const deleted = parts[1];
+              const filename = parts[2];
+              
+              // Skip binary files
+              if (added === '-' || deleted === '-') {
+                continue;
+              }
+              
+              // Only count pure code files
+              if (isArchiveFile(filename)) {
+                continue;
+              }
+              
+              const language = detectFileLanguage(filename);
+              if (!language) {
+                continue;
+              }
+              
+              // Try to get actual byte count for added lines
+              try {
+                const { stdout: diffContent } = await execPromise(`git show ${commit} -- "${filename}" | grep '^+' | grep -v '^+++' | wc -c`, {
+                  cwd: repoPath,
+                  encoding: 'utf8',
+                  shell: true
+                });
+                
+                const bytesAdded = parseInt(diffContent.trim(), 10) || 0;
+                totalPureCodeAddedBytes += bytesAdded;
+              } catch (innerError) {
+                // Fall back to line count estimation
+                const addedLineCount = parseInt(added, 10) || 0;
+                totalPureCodeAddedBytes += addedLineCount * 45;
+              }
+            }
+          } catch (commitError) {
+            // Skip problematic commits
+            continue;
+          }
+        }
+      }
+      
+      return totalPureCodeAddedBytes;
+    } catch (error) {
+      return 0;
+    }
+  }
+
   async analyzeRepository(repoPath) {
     try {
       const { stdout: commitCountOutput } = await execPromise('git rev-list --all --count', {
@@ -1130,12 +1292,39 @@ class GitAnalyzer extends BaseAnalyzer {
       const deduplicatedContributors = deduplicateContributors(allContributors);
       const uniqueContributors = deduplicatedContributors.length;
       
+      // Calculate average pure code added per commit
+      let totalPureCodeAdded = 0;
+      let averagePureCodeAddedPerCommit = 0;
+      let averagePureCodeAddedPerCommitFormatted = '0 B';
+      
+      if (totalCommits > 0) {
+        // Use the efficient method first (single pass)
+        totalPureCodeAdded = await this.getTotalPureCodeAdded(repoPath);
+        
+        // If the result seems too low (possible parsing issue), try accurate method
+        if (totalPureCodeAdded === 0 && totalCommits > 10) {
+          totalPureCodeAdded = await this.getTotalPureCodeAddedAccurate(repoPath);
+        }
+        
+        averagePureCodeAddedPerCommit = totalCommits > 0 
+          ? Math.round(totalPureCodeAdded / totalCommits) 
+          : 0;
+        
+        averagePureCodeAddedPerCommitFormatted = formatSize(averagePureCodeAddedPerCommit);
+      }
+      
       return {
         path: repoPath,
         name: path.basename(repoPath),
         totalCommits,
         uniqueContributors,
         contributors: deduplicatedContributors,
+        totalPureCodeAdded,
+        totalPureCodeAddedFormatted: formatSize(totalPureCodeAdded),
+        totalPureCodeAddedMB: formatMB(totalPureCodeAdded),
+        averagePureCodeAddedPerCommit,
+        averagePureCodeAddedPerCommitFormatted,
+        averagePureCodeAddedPerCommitMB: formatMB(averagePureCodeAddedPerCommit),
         success: true
       };
     } catch (error) {
@@ -1145,6 +1334,12 @@ class GitAnalyzer extends BaseAnalyzer {
         totalCommits: 0,
         uniqueContributors: 0,
         contributors: [],
+        totalPureCodeAdded: 0,
+        totalPureCodeAddedFormatted: '0 B',
+        totalPureCodeAddedMB: '0.00',
+        averagePureCodeAddedPerCommit: 0,
+        averagePureCodeAddedPerCommitFormatted: '0 B',
+        averagePureCodeAddedPerCommitMB: '0.00',
         success: false,
         error: error.message
       };
@@ -1169,6 +1364,10 @@ class GitAnalyzer extends BaseAnalyzer {
     const successfulRepos = this.repositories.filter(r => r.success).length;
     const totalCommitsAcrossRepos = this.repositories.reduce((sum, repo) => sum + repo.totalCommits, 0);
     const totalUniqueContributorsAcrossRepos = this.repositories.reduce((sum, repo) => sum + repo.uniqueContributors, 0);
+    const totalPureCodeAddedAcrossRepos = this.repositories.reduce((sum, repo) => sum + (repo.totalPureCodeAdded || 0), 0);
+    const averagePureCodeAddedPerCommitAcrossRepos = totalCommitsAcrossRepos > 0
+      ? Math.round(totalPureCodeAddedAcrossRepos / totalCommitsAcrossRepos)
+      : 0;
     
     const repoWithMostContributors = this.repositories.length > 0
       ? this.repositories.reduce((max, repo) => repo.uniqueContributors > max.uniqueContributors ? repo : max, this.repositories[0])
@@ -1184,6 +1383,12 @@ class GitAnalyzer extends BaseAnalyzer {
       failedRepositories: totalRepos - successfulRepos,
       totalCommits: totalCommitsAcrossRepos,
       totalUniqueContributors: totalUniqueContributorsAcrossRepos,
+      totalPureCodeAdded: totalPureCodeAddedAcrossRepos,
+      totalPureCodeAddedFormatted: formatSize(totalPureCodeAddedAcrossRepos),
+      totalPureCodeAddedMB: formatMB(totalPureCodeAddedAcrossRepos),
+      averagePureCodeAddedPerCommit: averagePureCodeAddedPerCommitAcrossRepos,
+      averagePureCodeAddedPerCommitFormatted: formatSize(averagePureCodeAddedPerCommitAcrossRepos),
+      averagePureCodeAddedPerCommitMB: formatMB(averagePureCodeAddedPerCommitAcrossRepos),
       repositories: this.repositories,
       repoWithMostContributors: repoWithMostContributors,
       repoWithMostCommits: repoWithMostCommits
@@ -1300,12 +1505,15 @@ function printGitAnalysis(gitReport) {
   if (gitReport.successfulRepositories > 0) {
     printKeyValue('Total commits (all repos)', gitReport.totalCommits.toLocaleString(), colors.green, 25, 15);
     printKeyValue('Unique contributors (all repos)', gitReport.totalUniqueContributors.toLocaleString(), colors.cyan, 25, 15);
+    printKeyValue('Total pure code added', gitReport.totalPureCodeAddedFormatted, colors.green, 25, 15);
+    printKeyValue('Avg pure code/commit', gitReport.averagePureCodeAddedPerCommitFormatted, colors.yellow, 25, 15);
     
     if (gitReport.repoWithMostContributors && gitReport.repoWithMostContributors.uniqueContributors > 0) {
       console.log(`\n  ${colors.dim}Repository with most contributors:${colors.reset}`);
       console.log(`    ${colors.yellow}📦 ${truncate(gitReport.repoWithMostContributors.name, 50)}${colors.reset}`);
       console.log(`    ${colors.cyan}   👥 ${gitReport.repoWithMostContributors.uniqueContributors} unique contributors${colors.reset}`);
       console.log(`    ${colors.green}   📝 ${gitReport.repoWithMostContributors.totalCommits.toLocaleString()} total commits${colors.reset}`);
+      console.log(`    ${colors.yellow}   📊 Avg pure code/commit: ${gitReport.repoWithMostContributors.averagePureCodeAddedPerCommitFormatted}${colors.reset}`);
     }
     
     if (gitReport.repoWithMostCommits && gitReport.repoWithMostCommits !== gitReport.repoWithMostContributors) {
@@ -1313,6 +1521,7 @@ function printGitAnalysis(gitReport) {
       console.log(`    ${colors.yellow}📦 ${truncate(gitReport.repoWithMostCommits.name, 50)}${colors.reset}`);
       console.log(`    ${colors.green}   📝 ${gitReport.repoWithMostCommits.totalCommits.toLocaleString()} total commits${colors.reset}`);
       console.log(`    ${colors.cyan}   👥 ${gitReport.repoWithMostCommits.uniqueContributors} unique contributors${colors.reset}`);
+      console.log(`    ${colors.yellow}   📊 Avg pure code/commit: ${gitReport.repoWithMostCommits.averagePureCodeAddedPerCommitFormatted}${colors.reset}`);
     }
     
     if (gitReport.repositories.length > 0) {
@@ -1320,7 +1529,7 @@ function printGitAnalysis(gitReport) {
       gitReport.repositories.slice(0, 5).forEach((repo, idx) => {
         if (repo.success) {
           const statusIcon = repo.uniqueContributors > 0 ? '✓' : '○';
-          console.log(`    ${colors.green}${statusIcon}${colors.reset} ${truncate(repo.name, 40)} - ${colors.cyan}${repo.uniqueContributors} contributors${colors.reset}, ${colors.green}${repo.totalCommits.toLocaleString()} commits${colors.reset}`);
+          console.log(`    ${colors.green}${statusIcon}${colors.reset} ${truncate(repo.name, 40)} - ${colors.cyan}${repo.uniqueContributors} contributors${colors.reset}, ${colors.green}${repo.totalCommits.toLocaleString()} commits${colors.reset}, ${colors.yellow}${repo.averagePureCodeAddedPerCommitFormatted}/commit${colors.reset}`);
         } else {
           console.log(`    ${colors.red}✗${colors.reset} ${truncate(repo.name, 40)} - ${colors.dim}Failed to analyze${colors.reset}`);
         }
@@ -1484,6 +1693,18 @@ function printGitComparison(directories, reportsByDir) {
       key: 'totalUniqueContributors', 
       winner: 'largest', 
       getValue: (r) => r['Git Analyzer'].totalUniqueContributors?.toLocaleString() || '0' 
+    },
+    { 
+      label: 'Pure Code Added', 
+      key: 'totalPureCodeAdded', 
+      winner: 'largest', 
+      getValue: (r) => r['Git Analyzer'].totalPureCodeAddedFormatted || '0 B' 
+    },
+    { 
+      label: 'Avg Pure/Commit', 
+      key: 'averagePureCodeAddedPerCommit', 
+      winner: 'largest', 
+      getValue: (r) => r['Git Analyzer'].averagePureCodeAddedPerCommitFormatted || '0 B' 
     }
   ];
   
@@ -1498,7 +1719,7 @@ function printGitComparison(directories, reportsByDir) {
       
       gitReport.repositories.slice(0, 3).forEach(repo => {
         if (repo.success) {
-          console.log(`      ${colors.green}└─${colors.reset} ${truncate(repo.name, 35)} - ${colors.cyan}${repo.uniqueContributors} contributors${colors.reset}, ${colors.green}${repo.totalCommits.toLocaleString()} commits${colors.reset}`);
+          console.log(`      ${colors.green}└─${colors.reset} ${truncate(repo.name, 35)} - ${colors.cyan}${repo.uniqueContributors} contributors${colors.reset}, ${colors.green}${repo.totalCommits.toLocaleString()} commits${colors.reset}, ${colors.yellow}${repo.averagePureCodeAddedPerCommitFormatted}/commit${colors.reset}`);
         } else {
           console.log(`      ${colors.red}└─${colors.reset} ${truncate(repo.name, 35)} - ${colors.dim}Failed to analyze${colors.reset}`);
         }
@@ -1742,7 +1963,9 @@ async function processSingleDirectory(targetDir) {
     summaryItems.push(
       { icon: '🔀', label: 'Repos', value: gitReport.totalRepositories, color: colors.magenta },
       { icon: '👥', label: 'Contributors', value: gitReport.totalUniqueContributors.toLocaleString(), color: colors.cyan },
-      { icon: '📝', label: 'Commits', value: gitReport.totalCommits.toLocaleString(), color: colors.green }
+      { icon: '📝', label: 'Commits', value: gitReport.totalCommits.toLocaleString(), color: colors.green },
+      { icon: '📊', label: 'Pure Code Added', value: gitReport.totalPureCodeAddedFormatted, color: colors.green },
+      { icon: '⚡', label: 'Avg Pure/Commit', value: gitReport.averagePureCodeAddedPerCommitFormatted, color: colors.yellow }
     );
   }
   
@@ -1937,7 +2160,9 @@ async function processMultipleDirectories(directories) {
     allMetrics.push(
       { label: 'Git Repos', key: 'totalRepositories', winner: 'largest' },
       { label: 'Total Commits', key: 'totalCommits', winner: 'largest' },
-      { label: 'Unique Contributors', key: 'totalUniqueContributors', winner: 'largest' }
+      { label: 'Unique Contributors', key: 'totalUniqueContributors', winner: 'largest' },
+      { label: 'Pure Code Added', key: 'totalPureCodeAdded', winner: 'largest' },
+      { label: 'Avg Pure/Commit', key: 'averagePureCodeAddedPerCommit', winner: 'largest' }
     );
   }
 
@@ -1969,6 +2194,12 @@ async function processMultipleDirectories(directories) {
       }
       if (metric.key === 'totalRepositories' || metric.key === 'totalCommits' || metric.key === 'totalUniqueContributors') {
         return flattenedReports[dir]['Git Analyzer'][metric.key] || 0;
+      }
+      if (metric.key === 'totalPureCodeAdded') {
+        return flattenedReports[dir]['Git Analyzer'].totalPureCodeAdded || 0;
+      }
+      if (metric.key === 'averagePureCodeAddedPerCommit') {
+        return flattenedReports[dir]['Git Analyzer'].averagePureCodeAddedPerCommit || 0;
       }
       return parseFloat(flattenedReports[dir][metric.key]) || 0;
     });
@@ -2153,7 +2384,9 @@ async function analyzeMultipleDirectoriesData(directories) {
     allMetrics.push(
       { label: 'Git Repos', key: 'totalRepositories', winner: 'largest' },
       { label: 'Total Commits', key: 'totalCommits', winner: 'largest' },
-      { label: 'Unique Contributors', key: 'totalUniqueContributors', winner: 'largest' }
+      { label: 'Unique Contributors', key: 'totalUniqueContributors', winner: 'largest' },
+      { label: 'Pure Code Added', key: 'totalPureCodeAdded', winner: 'largest' },
+      { label: 'Avg Pure/Commit', key: 'averagePureCodeAddedPerCommit', winner: 'largest' }
     );
   }
   
@@ -2180,6 +2413,12 @@ async function analyzeMultipleDirectoriesData(directories) {
       }
       if (metric.key === 'totalRepositories' || metric.key === 'totalCommits' || metric.key === 'totalUniqueContributors') {
         return report['Git Analyzer'][metric.key] || 0;
+      }
+      if (metric.key === 'totalPureCodeAdded') {
+        return report['Git Analyzer'].totalPureCodeAdded || 0;
+      }
+      if (metric.key === 'averagePureCodeAddedPerCommit') {
+        return report['Git Analyzer'].averagePureCodeAddedPerCommit || 0;
       }
       return parseFloat(report[metric.key]) || 0;
     });

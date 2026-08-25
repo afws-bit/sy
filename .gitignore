@@ -18,6 +18,8 @@ buildsaves.cfg
 .cfg
 .code-parser-configs.json
 bundle.output.js
+result
+result.txt
 
 # Ubuntu cloud image downloads
 alpine-cloudinit.qcow2.partial
