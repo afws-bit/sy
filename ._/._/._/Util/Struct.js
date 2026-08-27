@@ -22,16 +22,26 @@ function clearScreen() {
 }
 
 // ============================================================
+//  Format number with dot thousands separator
+//  Example: 1000000 -> 1.000.000
+// ============================================================
+function formatNumber(value) {
+    return value.toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+
+// ============================================================
 //  Read directory contents (async)
 // ============================================================
-async function readDirectory(dir) {
-    const entries = await fs.readdir(dir, { withFileTypes: true });
+async function readDirectory(directory) {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+
     // Sort: directories first, then alphabetically
     entries.sort((a, b) => {
         if (a.isDirectory() && !b.isDirectory()) return -1;
         if (!a.isDirectory() && b.isDirectory()) return 1;
         return a.name.localeCompare(b.name);
     });
+
     return entries;
 }
 
@@ -40,21 +50,23 @@ async function readDirectory(dir) {
 // ============================================================
 async function generateStruct(filePaths, outputFileName = 'struct') {
     let structContent = '';
+
     for (const filePath of filePaths) {
         try {
             const content = await fs.readFile(filePath, 'utf8');
+
             structContent += `${'='.repeat(50)}\n`;
             structContent += `FILE: ${filePath}\n`;
             structContent += `${'='.repeat(50)}\n`;
             structContent += content;
-            // Ensure a newline after each file content for separation
+
             if (!content.endsWith('\n')) structContent += '\n';
-            structContent += '\n'; // extra blank line between files
+            structContent += '\n';
         } catch (err) {
             console.error(`\nError reading ${filePath}: ${err.message}`);
-            // Continue with other files
         }
     }
+
     await fs.writeFile(outputFileName, structContent, 'utf8');
     console.log(`\nStruct file written to: ${path.resolve(outputFileName)}`);
 }
@@ -63,10 +75,12 @@ async function generateStruct(filePaths, outputFileName = 'struct') {
 //  Save absolute paths to a file (one per line) in /tmp
 // ============================================================
 async function savePaths(filePaths, saveName) {
-    const tmpDir = os.tmpdir();
-    const savePath = path.join(tmpDir, saveName);
+    const temporaryDirectory = os.tmpdir();
+    const savePath = path.join(temporaryDirectory, saveName);
+
     await fs.writeFile(savePath, filePaths.join('\n'), 'utf8');
     console.log(`Paths saved to: ${savePath}`);
+
     return savePath;
 }
 
@@ -74,104 +88,316 @@ async function savePaths(filePaths, saveName) {
 //  Load absolute paths from a savename file in /tmp
 // ============================================================
 async function loadPaths(saveName) {
-    const tmpDir = os.tmpdir();
-    const savePath = path.join(tmpDir, saveName);
+    const temporaryDirectory = os.tmpdir();
+    const savePath = path.join(temporaryDirectory, saveName);
     const data = await fs.readFile(savePath, 'utf8');
-    return data.split('\n')
+
+    return data
+        .split('\n')
         .map(line => line.trim())
         .filter(line => line.length > 0);
+}
+
+// ============================================================
+//  Token-count estimation based on file size
+//  Approximately 1 token per 4 bytes
+// ============================================================
+async function getFileTokenCount(filePath) {
+    try {
+        const stats = await fs.stat(filePath);
+        return Math.max(1, Math.round(stats.size / 4));
+    } catch {
+        return 0;
+    }
+}
+
+// ============================================================
+//  Recursively collect all file paths under a directory
+// ============================================================
+async function collectAllFiles(directory) {
+    let entries;
+
+    try {
+        entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch {
+        return [];
+    }
+
+    const files = [];
+
+    for (const entry of entries) {
+        const fullPath = path.join(directory, entry.name);
+
+        if (entry.isDirectory()) {
+            const nestedFiles = await collectAllFiles(fullPath);
+            files.push(...nestedFiles);
+        } else if (entry.isFile()) {
+            files.push(fullPath);
+        }
+    }
+
+    return files;
 }
 
 // ============================================================
 //  Interactive file/directory navigation & selection
 // ============================================================
 async function interactiveMode() {
-    // Save original terminal settings
     const originalRawMode = process.stdin.isRaw;
+
     process.stdin.setRawMode(true);
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
 
-    let currentDir = process.cwd();
-    let entries = await readDirectory(currentDir);
+    let currentDirectory = process.cwd();
+    let entries = await readDirectory(currentDirectory);
     let cursorIndex = 0;
-    const selectedFiles = new Set(); // store absolute paths of selected files
+    let scrollOffset = 0;
 
+    const selectedFiles = new Set();
+    const selectedTokenCounts = new Map();
+    let totalTokens = 0;
+
+    // --------------------------------------------------------
+    //  Dynamic pagination based on terminal height
+    // --------------------------------------------------------
+    function getMaxEntries() {
+        const terminalRows = process.stdout.rows || 24;
+        // Reserve space for:
+        //  1. current directory line
+        //  2. selected files + tokens line
+        //  3. separator
+        //  4. help line
+        //  5. separator
+        //  6. optional pagination footer
+        return Math.max(1, terminalRows - 6);
+    }
+
+    function adjustScrollOffset() {
+        const maxEntries = getMaxEntries();
+
+        if (cursorIndex < scrollOffset) {
+            scrollOffset = cursorIndex;
+        }
+
+        if (cursorIndex >= scrollOffset + maxEntries) {
+            scrollOffset = cursorIndex - maxEntries + 1;
+        }
+
+        const maxScrollOffset = Math.max(0, entries.length - maxEntries);
+        if (scrollOffset > maxScrollOffset) {
+            scrollOffset = maxScrollOffset;
+        }
+
+        if (scrollOffset < 0) {
+            scrollOffset = 0;
+        }
+    }
+
+    // --------------------------------------------------------
+    //  Selection helpers
+    // --------------------------------------------------------
+    async function selectFile(filePath) {
+        if (selectedFiles.has(filePath)) return;
+
+        const tokenCount = await getFileTokenCount(filePath);
+
+        selectedFiles.add(filePath);
+        selectedTokenCounts.set(filePath, tokenCount);
+        totalTokens += tokenCount;
+    }
+
+    function deselectFile(filePath) {
+        if (!selectedFiles.has(filePath)) return;
+
+        const tokenCount = selectedTokenCounts.get(filePath) || 0;
+
+        selectedFiles.delete(filePath);
+        selectedTokenCounts.delete(filePath);
+        totalTokens -= tokenCount;
+    }
+
+    async function toggleFile(filePath) {
+        if (selectedFiles.has(filePath)) {
+            deselectFile(filePath);
+        } else {
+            await selectFile(filePath);
+        }
+    }
+
+    async function toggleAllInCurrentDirectory() {
+        const filePaths = entries
+            .filter(entry => entry.isFile())
+            .map(entry => path.join(currentDirectory, entry.name));
+
+        const allSelected = filePaths.length > 0 && filePaths.every(filePath => selectedFiles.has(filePath));
+
+        if (allSelected) {
+            for (const filePath of filePaths) {
+                deselectFile(filePath);
+            }
+        } else {
+            for (const filePath of filePaths) {
+                if (!selectedFiles.has(filePath)) {
+                    await selectFile(filePath);
+                }
+            }
+        }
+    }
+
+    async function toggleAllRecursivelyFromCurrentDirectory() {
+        const filePaths = await collectAllFiles(currentDirectory);
+
+        const allSelected = filePaths.length > 0 && filePaths.every(filePath => selectedFiles.has(filePath));
+
+        if (allSelected) {
+            for (const filePath of filePaths) {
+                deselectFile(filePath);
+            }
+        } else {
+            for (const filePath of filePaths) {
+                if (!selectedFiles.has(filePath)) {
+                    await selectFile(filePath);
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    //  Render the file browser view
+    // --------------------------------------------------------
     const render = () => {
         clearScreen();
-        console.log(`${BOLD}${BLUE}Current directory:${RESET} ${YELLOW}${currentDir}${RESET}`);
-        console.log(`${BOLD}Selected: ${selectedFiles.size} file(s)${RESET}`);
+
+        const maxEntries = getMaxEntries();
+        adjustScrollOffset();
+
+        const visibleEntries = entries.slice(scrollOffset, scrollOffset + maxEntries);
+        const totalEntries = entries.length;
+        const hasPagination = totalEntries > maxEntries;
+
+        console.log(`${BOLD}${BLUE}Current directory:${RESET} ${YELLOW}${currentDirectory}${RESET}`);
+        console.log(`${BOLD}Selected: ${selectedFiles.size} file(s) | Tokens: ${formatNumber(totalTokens)}${RESET}`);
         console.log('─'.repeat(process.stdout.columns || 80));
-        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, Enter open dir/select file, Space select file, g generate, b back, q quit`);
+        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, g gen, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
 
-        entries.forEach((entry, idx) => {
+        visibleEntries.forEach((entry, index) => {
+            const actualIndex = scrollOffset + index;
             let prefix = ' ';
+
             if (entry.isDirectory()) {
                 prefix = `${BLUE}[DIR]${RESET} `;
-            } else if (selectedFiles.has(path.join(currentDir, entry.name))) {
+            } else if (selectedFiles.has(path.join(currentDirectory, entry.name))) {
                 prefix = `${GREEN}[✔]${RESET} `;
             } else {
                 prefix = '[ ] ';
             }
+
             const line = `${prefix} ${entry.name}${entry.isDirectory() ? '/' : ''}`;
-            if (idx === cursorIndex) {
+
+            if (actualIndex === cursorIndex) {
                 console.log(`${REVERSE}${line}${RESET}`);
             } else {
                 console.log(line);
             }
         });
+
+        if (hasPagination) {
+            const currentPage = Math.floor(scrollOffset / maxEntries) + 1;
+            const totalPages = Math.ceil(totalEntries / maxEntries);
+            console.log(`─ ${BOLD}${currentPage}${RESET}/${totalPages} ${totalEntries} items`);
+        }
     };
 
-    // Main keypress handler
+    // --------------------------------------------------------
+    //  Cleanup function to restore terminal and exit
+    // --------------------------------------------------------
+    const cleanupAndExit = (code) => {
+        process.stdin.setRawMode(originalRawMode);
+        process.stdin.pause();
+        process.exit(code);
+    };
+
+    // --------------------------------------------------------
+    //  Main keypress handler
+    // --------------------------------------------------------
     const onKeypress = async (key) => {
-        // Arrow keys (escape sequences)
-        if (key === '\u001b[A') { // up
+        const maxEntries = getMaxEntries();
+
+        // Arrow up
+        if (key === '\u001b[A') {
             if (cursorIndex > 0) cursorIndex--;
             render();
             return;
         }
-        if (key === '\u001b[B') { // down
+
+        // Arrow down
+        if (key === '\u001b[B') {
             if (cursorIndex < entries.length - 1) cursorIndex++;
             render();
             return;
         }
 
-        // Space: toggle selection (only for files)
-        if (key === ' ') {
-            if (entries.length > 0 && cursorIndex >= 0 && cursorIndex < entries.length) {
-                const entry = entries[cursorIndex];
-                if (!entry.isDirectory()) {
-                    const fullPath = path.join(currentDir, entry.name);
-                    if (selectedFiles.has(fullPath)) {
-                        selectedFiles.delete(fullPath);
-                    } else {
-                        selectedFiles.add(fullPath);
-                    }
-                }
-            }
+        // PageUp
+        if (key === '\u001b[5~') {
+            cursorIndex = Math.max(0, cursorIndex - maxEntries);
             render();
             return;
         }
 
-        // Enter: navigate into directory or toggle selection for files
+        // PageDown
+        if (key === '\u001b[6~') {
+            cursorIndex = Math.min(entries.length - 1, cursorIndex + maxEntries);
+            render();
+            return;
+        }
+
+        // Space: toggle selection for files only
+        if (key === ' ') {
+            if (entries.length > 0 && cursorIndex >= 0 && cursorIndex < entries.length) {
+                const entry = entries[cursorIndex];
+
+                if (!entry.isDirectory()) {
+                    const fullPath = path.join(currentDirectory, entry.name);
+                    await toggleFile(fullPath);
+                }
+            }
+
+            render();
+            return;
+        }
+
+        // Enter: navigate into directory or toggle file selection
         if (key === '\r' || key === '\n') {
             if (entries.length > 0 && cursorIndex >= 0 && cursorIndex < entries.length) {
                 const entry = entries[cursorIndex];
+
                 if (entry.isDirectory()) {
-                    currentDir = path.join(currentDir, entry.name);
-                    entries = await readDirectory(currentDir);
+                    currentDirectory = path.join(currentDirectory, entry.name);
+                    entries = await readDirectory(currentDirectory);
                     cursorIndex = 0;
+                    scrollOffset = 0;
                 } else {
-                    // Toggle file selection with Enter
-                    const fullPath = path.join(currentDir, entry.name);
-                    if (selectedFiles.has(fullPath)) {
-                        selectedFiles.delete(fullPath);
-                    } else {
-                        selectedFiles.add(fullPath);
-                    }
+                    const fullPath = path.join(currentDirectory, entry.name);
+                    await toggleFile(fullPath);
                 }
             }
+
+            render();
+            return;
+        }
+
+        // 'a': toggle all files in current directory only
+        if (key === 'a') {
+            await toggleAllInCurrentDirectory();
+            render();
+            return;
+        }
+
+        // 'A': toggle all files recursively under current directory
+        if (key === 'A') {
+            await toggleAllRecursivelyFromCurrentDirectory();
             render();
             return;
         }
@@ -183,51 +409,52 @@ async function interactiveMode() {
                 render();
                 return;
             }
-            // Generate struct file in current working directory
+
             await generateStruct([...selectedFiles]);
-            // Ask to save paths
-            process.stdin.setRawMode(false); // temporarily disable raw mode for input
+
+            // Temporarily disable raw mode for the save-name prompt
+            process.stdin.removeListener('data', onKeypress);
+            process.stdin.setRawMode(false);
+
             console.log('\nSave selected file paths? Enter a filename (or leave empty to skip): ');
             const saveName = await new Promise(resolve => {
                 process.stdin.once('data', data => {
                     resolve(data.toString().trim());
                 });
             });
+
             process.stdin.setRawMode(true);
+
             if (saveName) {
                 await savePaths([...selectedFiles], saveName);
             }
-            // Exit interactive mode
+
             cleanupAndExit(0);
             return;
         }
 
         // 'b' or 'B': go to parent directory
         if (key === 'b' || key === 'B') {
-            const parent = path.dirname(currentDir);
-            if (parent !== currentDir) { // not at root
-                currentDir = parent;
-                entries = await readDirectory(currentDir);
+            const parent = path.dirname(currentDirectory);
+
+            if (parent !== currentDirectory) {
+                currentDirectory = parent;
+                entries = await readDirectory(currentDirectory);
                 cursorIndex = 0;
+                scrollOffset = 0;
             }
+
             render();
             return;
         }
 
-        // 'q' or 'Q': quit without generating
-        if (key === 'q' || key === 'Q' || key === '\u0003') { // Ctrl+C also quits
+        // 'q' or 'Q' or Ctrl+C: quit without generating
+        if (key === 'q' || key === 'Q' || key === '\u0003') {
             cleanupAndExit(0);
             return;
         }
 
         // Any other key: ignore
-    };
-
-    // Cleanup function to restore terminal and exit
-    const cleanupAndExit = (code) => {
-        process.stdin.setRawMode(originalRawMode);
-        process.stdin.pause();
-        process.exit(code);
     };
 
     process.stdin.on('data', onKeypress);
@@ -243,12 +470,15 @@ async function main() {
     if (args.length > 0) {
         // Regeneration mode: load saved paths from /tmp and generate struct
         const saveName = args[0];
+
         try {
             const paths = await loadPaths(saveName);
+
             if (paths.length === 0) {
                 console.error('No paths found in save file.');
                 process.exit(1);
             }
+
             await generateStruct(paths);
         } catch (err) {
             console.error(`Error: ${err.message}`);
