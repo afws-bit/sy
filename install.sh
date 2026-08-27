@@ -104,7 +104,7 @@ get_command_working_dir() {
         "qemu") echo "file" ;;
         "lay") echo "caller" ;;   
         "arc") echo "caller" ;;  
-        "labssh") echo "global" ;; 
+        "labssh") echo "caller" ;; 
         "codeparser") echo "caller" ;; 
         "struct") echo "caller" ;; 
         "shinstall") echo "caller" ;; 

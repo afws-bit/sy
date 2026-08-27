@@ -3,7 +3,7 @@ import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import { mkdir, writeFile, chmod, access, readFile, unlink, rename, rm } from 'fs/promises';
 import { homedir } from 'os';
-import { join, dirname } from 'path';
+import { join, dirname, basename } from 'path';
 import { networkInterfaces } from 'os';
 import * as net from 'net';
 import { fileURLToPath } from 'url';
@@ -257,6 +257,84 @@ static async scp(host, paths, options = {}) {
   return {
     success: successCount === sources.length,
     message: `${successCount}/${sources.length} files sent to ${host}:${destPath}`,
+    files: results
+  };
+}
+
+/**
+ * Fetch files from remote host via SCP
+ * @param {string} host - Target IP
+ * @param {string|Array<string>} paths - Remote file(s) to fetch
+ * @param {Object} options - Options
+ * @param {string} options.user - SSH user (default: 'root')
+ * @param {string} options.password - SSH password (optional)
+ * @param {string} options.dest - Local destination directory (default: current working directory)
+ * @param {number} options.port - SSH port (default: 22)
+ * @returns {Promise<Object>}
+ */
+static async fetch(host, paths, options = {}) {
+  const { user = 'root', password = null, dest = process.cwd(), port = 22 } = options;
+  
+  if (!host || !paths) return { success: false, message: 'Host and paths required' };
+
+  const sources = Array.isArray(paths) ? paths : [paths];
+  
+  console.error(`[fetch] Fetching ${sources.length} file(s) from ${user}@${host} to ${dest}`);
+
+  // Build base SCP args
+  const scpArgs = [
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'UserKnownHostsFile=/dev/null',
+    '-o', 'ConnectTimeout=10',
+    '-r', '-p', '-C',
+    '-P', String(port)
+  ];
+
+  // Authentication
+  let useSshpass = false;
+  if (password) {
+    const hasSshpass = await this._ensureSshpass();
+    if (hasSshpass) useSshpass = true;
+    else scpArgs.push('-i', join(homedir(), '.ssh', 'id_rsa'));
+  } else {
+    scpArgs.push('-i', join(homedir(), '.ssh', 'id_rsa'), '-o', 'BatchMode=yes');
+  }
+
+  // Ensure local destination directory exists
+  try {
+    await mkdir(dest, { recursive: true });
+  } catch (error) {
+    return { success: false, message: `Failed to create local destination: ${error.message}` };
+  }
+
+  // Fetch files
+  const results = [];
+  for (const source of sources) {
+    const cmd = useSshpass 
+      ? `sshpass -p '${password.replace(/'/g, "'\\''")}' scp ${scpArgs.join(' ')} ${user}@${host}:"${source}" "${dest}/"`
+      : `scp ${scpArgs.join(' ')} ${user}@${host}:"${source}" "${dest}/"`;
+    
+    const result = await this._exec(cmd, { timeout: 300000 });
+    
+    // Extract the filename from the remote path
+    const remoteFilename = basename(source);
+    const localPath = join(dest, remoteFilename);
+    
+    results.push({
+      file: source,
+      localPath: result.success ? localPath : null,
+      success: result.success,
+      error: result.success ? null : (result.stderr || result.error)
+    });
+    
+    console.error(`[fetch] ${result.success ? '✓' : '✗'} ${source} -> ${localPath}`);
+  }
+
+  const successCount = results.filter(r => r.success).length;
+  return {
+    success: successCount === sources.length,
+    message: `${successCount}/${sources.length} files fetched from ${host} to ${dest}`,
+    dest: dest,
     files: results
   };
 }
@@ -2524,6 +2602,7 @@ Methods:
   toggle-config                  Update toggle scan configuration (restarts if on)
   hard-reset                     Complete cleanup: kill all processes, remove all files
   scp <host> <files...>        Send files via SCP (default dest: /home/)
+  fetch <host> <files...>      Fetch files from remote (default dest: current directory)
   exec <host> <commands...>    Execute commands and wait for result
   exec-bg <host> <commands...> Execute commands in background (nohup)
 
@@ -2552,6 +2631,11 @@ Toggle Examples:
   node ssh-lab.mjs toggle-off
   node ssh-lab.mjs toggle-status
   node ssh-lab.mjs toggle-config --blacklist=192.168.0.0/16
+
+Fetch Examples:
+  node ssh-lab.mjs fetch 10.10.10.100 /home/user/file.txt
+  node ssh-lab.mjs fetch 10.10.10.100 /home/user/file1.txt /home/user/file2.txt --dest=/local/dir/
+  node ssh-lab.mjs fetch 192.168.1.100 /etc/passwd --password=secret123
 
 Hard Reset:
   node ssh-lab.mjs hard-reset
@@ -2674,6 +2758,32 @@ Hard Reset:
           };
           
           result = await SSH.scp(host, files.length === 1 ? files[0] : files, scpOptions);
+          break;
+        }
+
+        case 'fetch': {
+          const pathArgs = args.filter(a => !a.startsWith('--'));
+          
+          if (pathArgs.length < 2) {
+            console.error('Usage: node ssh-lab.mjs fetch <host> <remote_file1> [remote_file2...] [--dest=<path>] [--user=<user>] [--password=<pass>]');
+            console.error('Examples:');
+            console.error('  node ssh-lab.mjs fetch 10.10.10.100 /home/user/file.txt');
+            console.error('  node ssh-lab.mjs fetch 10.10.10.100 /home/user/file1.txt /home/user/file2.txt --dest=/local/dir/');
+            console.error('  node ssh-lab.mjs fetch 192.168.1.100 /etc/passwd --password=secret123');
+            process.exit(1);
+          }
+          
+          const host = pathArgs[0];
+          const files = pathArgs.slice(1);
+          
+          const fetchOptions = {
+            user: args.find(a => a.startsWith('--user='))?.split('=')[1] || 'root',
+            port: parseInt(args.find(a => a.startsWith('--port='))?.split('=')[1] || '22'),
+            password: args.find(a => a.startsWith('--password='))?.split('=')[1] || null,
+            dest: args.find(a => a.startsWith('--dest='))?.split('=')[1] || process.cwd()
+          };
+          
+          result = await SSH.fetch(host, files.length === 1 ? files[0] : files, fetchOptions);
           break;
         }
 
