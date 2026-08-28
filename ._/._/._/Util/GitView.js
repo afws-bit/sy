@@ -2,23 +2,749 @@
 
 /**
  * GitView - Comprehensive Git Repository Visualization and Analysis Tool
- * Enhanced with complete Pack.js integration, grouping, and comparison features
+ * Enhanced with complete Pack.js integration, user authentication, and repository management
  */
 
 import { spawnSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
+import crypto from 'crypto';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { parse as parseUrl } from 'url';
-import crypto from 'crypto';
 import analyzeDirectories from '../Packager/Pack.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // ============================================================================
-// CACHE MANAGER
+// DATABASE MANAGER - JSON-based storage with authentication
+// ============================================================================
+
+class DatabaseManager {
+    constructor() {
+        this.dataDir = path.join('/tmp', 'gitview-data');
+        this.dbFile = path.join(this.dataDir, 'database.json');
+        this.logsFile = path.join(this.dataDir, 'logs.json');
+        this.sessionsFile = path.join(this.dataDir, 'sessions.json');
+        this.ensureDataDir();
+        this.ensureDatabase();
+        this.loggingEnabled = false;
+    }
+
+    ensureDataDir() {
+        if (!fs.existsSync(this.dataDir)) {
+            fs.mkdirSync(this.dataDir, { recursive: true });
+        }
+    }
+
+    ensureDatabase() {
+        // Ensure database.json exists with proper structure
+        if (!fs.existsSync(this.dbFile)) {
+            const initialDB = {
+                users: [],
+                repos: [],
+                groups: [],
+                sessions: [],
+                settings: {
+                    loggingEnabled: false,
+                    registrationOpen: true
+                }
+            };
+            fs.writeFileSync(this.dbFile, JSON.stringify(initialDB, null, 2), 'utf8');
+        } else {
+            // Validate existing database structure
+            try {
+                const raw = fs.readFileSync(this.dbFile, 'utf8');
+                const db = JSON.parse(raw);
+                
+                // Ensure all required arrays exist
+                if (!db.users || !Array.isArray(db.users)) {
+                    db.users = [];
+                }
+                if (!db.repos || !Array.isArray(db.repos)) {
+                    db.repos = [];
+                }
+                if (!db.groups || !Array.isArray(db.groups)) {
+                    db.groups = [];
+                }
+                if (!db.sessions || !Array.isArray(db.sessions)) {
+                    db.sessions = [];
+                }
+                if (!db.settings || typeof db.settings !== 'object') {
+                    db.settings = {
+                        loggingEnabled: false,
+                        registrationOpen: true
+                    };
+                }
+                
+                // Save corrected structure
+                fs.writeFileSync(this.dbFile, JSON.stringify(db, null, 2), 'utf8');
+            } catch (error) {
+                // If file is corrupted, recreate it
+                console.error(`Database file corrupted, recreating: ${error.message}`);
+                const initialDB = {
+                    users: [],
+                    repos: [],
+                    groups: [],
+                    sessions: [],
+                    settings: {
+                        loggingEnabled: false,
+                        registrationOpen: true
+                    }
+                };
+                fs.writeFileSync(this.dbFile, JSON.stringify(initialDB, null, 2), 'utf8');
+            }
+        }
+        
+        // Ensure logs.json exists
+        if (!fs.existsSync(this.logsFile)) {
+            fs.writeFileSync(this.logsFile, JSON.stringify({ logs: [] }, null, 2), 'utf8');
+        }
+        
+        // Ensure sessions.json exists
+        if (!fs.existsSync(this.sessionsFile)) {
+            fs.writeFileSync(this.sessionsFile, JSON.stringify({ sessions: [] }, null, 2), 'utf8');
+        }
+    }
+
+    loadDB() {
+        try {
+            const raw = fs.readFileSync(this.dbFile, 'utf8');
+            const db = JSON.parse(raw);
+            
+            // Validate and ensure proper structure
+            if (!db || typeof db !== 'object') {
+                throw new Error('Invalid database structure');
+            }
+            
+            // Ensure all required arrays exist
+            if (!Array.isArray(db.users)) {
+                db.users = [];
+            }
+            if (!Array.isArray(db.repos)) {
+                db.repos = [];
+            }
+            if (!Array.isArray(db.groups)) {
+                db.groups = [];
+            }
+            if (!Array.isArray(db.sessions)) {
+                db.sessions = [];
+            }
+            if (!db.settings || typeof db.settings !== 'object') {
+                db.settings = {
+                    loggingEnabled: false,
+                    registrationOpen: true
+                };
+            }
+            
+            return db;
+        } catch (error) {
+            console.error(`Failed to load database: ${error.message}`);
+            // Return a fresh database structure
+            return {
+                users: [],
+                repos: [],
+                groups: [],
+                sessions: [],
+                settings: {
+                    loggingEnabled: false,
+                    registrationOpen: true
+                }
+            };
+        }
+    }
+
+    saveDB(db) {
+        try {
+            // Validate db structure before saving
+            if (!db || typeof db !== 'object') {
+                throw new Error('Invalid database object');
+            }
+            
+            // Ensure all required arrays exist
+            if (!Array.isArray(db.users)) {
+                db.users = [];
+            }
+            if (!Array.isArray(db.repos)) {
+                db.repos = [];
+            }
+            if (!Array.isArray(db.groups)) {
+                db.groups = [];
+            }
+            if (!Array.isArray(db.sessions)) {
+                db.sessions = [];
+            }
+            if (!db.settings || typeof db.settings !== 'object') {
+                db.settings = {
+                    loggingEnabled: false,
+                    registrationOpen: true
+                };
+            }
+            
+            fs.writeFileSync(this.dbFile, JSON.stringify(db, null, 2), 'utf8');
+            return true;
+        } catch (error) {
+            console.error(`Failed to save database: ${error.message}`);
+            return false;
+        }
+    }
+
+    loadLogs() {
+        try {
+            if (!fs.existsSync(this.logsFile)) {
+                return { logs: [] };
+            }
+            const raw = fs.readFileSync(this.logsFile, 'utf8');
+            const logsData = JSON.parse(raw);
+            
+            // Ensure logs array exists
+            if (!logsData || !Array.isArray(logsData.logs)) {
+                return { logs: [] };
+            }
+            
+            return logsData;
+        } catch (error) {
+            console.error(`Failed to load logs: ${error.message}`);
+            return { logs: [] };
+        }
+    }
+
+    saveLogs(logsData) {
+        try {
+            // Validate logs structure
+            if (!logsData || !Array.isArray(logsData.logs)) {
+                logsData = { logs: [] };
+            }
+            
+            fs.writeFileSync(this.logsFile, JSON.stringify(logsData, null, 2), 'utf8');
+            return true;
+        } catch (error) {
+            console.error(`Failed to save logs: ${error.message}`);
+            return false;
+        }
+    }
+
+    loadSessions() {
+        try {
+            if (!fs.existsSync(this.sessionsFile)) {
+                return { sessions: [] };
+            }
+            const raw = fs.readFileSync(this.sessionsFile, 'utf8');
+            const sessionsData = JSON.parse(raw);
+            
+            // Ensure sessions array exists
+            if (!sessionsData || !Array.isArray(sessionsData.sessions)) {
+                return { sessions: [] };
+            }
+            
+            return sessionsData;
+        } catch (error) {
+            console.error(`Failed to load sessions: ${error.message}`);
+            return { sessions: [] };
+        }
+    }
+
+    saveSessions(sessionsData) {
+        try {
+            // Validate sessions structure
+            if (!sessionsData || !Array.isArray(sessionsData.sessions)) {
+                sessionsData = { sessions: [] };
+            }
+            
+            fs.writeFileSync(this.sessionsFile, JSON.stringify(sessionsData, null, 2), 'utf8');
+            return true;
+        } catch (error) {
+            console.error(`Failed to save sessions: ${error.message}`);
+            return false;
+        }
+    }
+
+    log(level, message, metadata = {}) {
+        const db = this.loadDB();
+        if (!db.settings?.loggingEnabled) return;
+
+        const logsData = this.loadLogs();
+        const logEntry = {
+            id: crypto.randomUUID(),
+            timestamp: new Date().toISOString(),
+            level,
+            message,
+            metadata
+        };
+        
+        logsData.logs.unshift(logEntry);
+        
+        // Keep only last 1000 logs
+        if (logsData.logs.length > 1000) {
+            logsData.logs = logsData.logs.slice(0, 1000);
+        }
+        
+        this.saveLogs(logsData);
+    }
+
+    clearLogs() {
+        this.saveLogs({ logs: [] });
+        return true;
+    }
+
+    toggleLogging() {
+        const db = this.loadDB();
+        if (!db.settings) {
+            db.settings = {};
+        }
+        db.settings.loggingEnabled = !db.settings.loggingEnabled;
+        this.saveDB(db);
+        return db.settings.loggingEnabled;
+    }
+
+    getLoggingStatus() {
+        const db = this.loadDB();
+        return db.settings?.loggingEnabled || false;
+    }
+
+    clearAll() {
+        const freshDB = {
+            users: [],
+            repos: [],
+            groups: [],
+            sessions: [],
+            settings: {
+                loggingEnabled: this.getLoggingStatus(),
+                registrationOpen: true
+            }
+        };
+        this.saveDB(freshDB);
+        this.saveSessions({ sessions: [] });
+        this.saveLogs({ logs: [] });
+        return true;
+    }
+}
+
+// ============================================================================
+// AUTHENTICATION MANAGER
+// ============================================================================
+
+class AuthManager {
+    constructor(dbManager) {
+        this.db = dbManager;
+        this.sessions = new Map();
+    }
+
+    hashPassword(password, salt = null) {
+        const useSalt = salt || crypto.randomBytes(16).toString('hex');
+        const hash = crypto.pbkdf2Sync(password, useSalt, 10000, 64, 'sha512').toString('hex');
+        return { hash, salt: useSalt };
+    }
+
+    verifyPassword(password, salt, hash) {
+        const verifyHash = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+        return verifyHash === hash;
+    }
+
+    register(email, password, name) {
+        const db = this.db.loadDB();
+        
+        // Validate email
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            return { success: false, error: 'Invalid email format' };
+        }
+        
+        // Validate password
+        if (password.length < 6) {
+            return { success: false, error: 'Password must be at least 6 characters' };
+        }
+        
+        // Check if email already registered
+        const existingUser = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+        if (existingUser) {
+            return { success: false, error: 'Email already registered' };
+        }
+        
+        // Hash password
+        const { hash, salt } = this.hashPassword(password);
+        
+        // Create user
+        const user = {
+            id: crypto.randomUUID(),
+            email: email.toLowerCase(),
+            name: name || email.split('@')[0],
+            passwordHash: hash,
+            passwordSalt: salt,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        };
+        
+        db.users.push(user);
+        this.db.saveDB(db);
+        
+        this.db.log('info', 'User registered', { userId: user.id, email: user.email });
+        
+        return { 
+            success: true, 
+            user: { 
+                id: user.id, 
+                email: user.email, 
+                name: user.name,
+                createdAt: user.createdAt 
+            } 
+        };
+    }
+
+    login(email, password) {
+        const db = this.db.loadDB();
+        
+        const user = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+        if (!user) {
+            return { success: false, error: 'Invalid email or password' };
+        }
+        
+        if (!this.verifyPassword(password, user.passwordSalt, user.passwordHash)) {
+            return { success: false, error: 'Invalid email or password' };
+        }
+        
+        // Create session
+        const sessionToken = crypto.randomBytes(32).toString('hex');
+        const session = {
+            token: sessionToken,
+            userId: user.id,
+            createdAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString() // 7 days
+        };
+        
+        db.sessions.push(session);
+        this.db.saveDB(db);
+        
+        this.sessions.set(sessionToken, session);
+        
+        this.db.log('info', 'User logged in', { userId: user.id, email: user.email });
+        
+        return {
+            success: true,
+            token: sessionToken,
+            user: {
+                id: user.id,
+                email: user.email,
+                name: user.name
+            }
+        };
+    }
+
+    logout(token) {
+        const db = this.db.loadDB();
+        db.sessions = db.sessions.filter(s => s.token !== token);
+        this.db.saveDB(db);
+        this.sessions.delete(token);
+        
+        return { success: true };
+    }
+
+    validateSession(token) {
+        if (!token) return null;
+        
+        // Check memory first
+        if (this.sessions.has(token)) {
+            const session = this.sessions.get(token);
+            if (new Date(session.expiresAt) > new Date()) {
+                return session;
+            }
+            this.sessions.delete(token);
+            return null;
+        }
+        
+        // Check database
+        const db = this.db.loadDB();
+        const session = db.sessions.find(s => s.token === token);
+        if (session && new Date(session.expiresAt) > new Date()) {
+            this.sessions.set(token, session);
+            return session;
+        }
+        
+        return null;
+    }
+
+    getUserById(userId) {
+        const db = this.db.loadDB();
+        return db.users.find(u => u.id === userId);
+    }
+}
+
+// ============================================================================
+// REPOSITORY MANAGER
+// ============================================================================
+
+class RepositoryManager {
+    constructor(dbManager, authManager) {
+        this.db = dbManager;
+        this.auth = authManager;
+        this.repoCache = new Map();
+        this.analysisCache = new Map();
+    }
+
+    addRepository(token, repoPath, name = null, description = '') {
+        const session = this.auth.validateSession(token);
+        if (!session) {
+            return { success: false, error: 'Invalid or expired session' };
+        }
+        
+        const resolvedPath = path.resolve(repoPath);
+        
+        // Validate it's a git repo
+        try {
+            const gitView = new GitView(resolvedPath);
+        } catch (error) {
+            return { success: false, error: `Not a valid git repository: ${resolvedPath}` };
+        }
+        
+        const db = this.db.loadDB();
+        
+        // Check if repo already exists
+        const existingRepo = db.repos.find(r => r.path === resolvedPath);
+        if (existingRepo) {
+            return { success: false, error: 'Repository already exists' };
+        }
+        
+        const repo = {
+            id: crypto.randomUUID(),
+            ownerId: session.userId,
+            path: resolvedPath,
+            name: name || path.basename(resolvedPath),
+            description: description,
+            isPublic: true, // All repos initially public
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        };
+        
+        db.repos.push(repo);
+        this.db.saveDB(db);
+        
+        this.db.log('info', 'Repository added', { repoId: repo.id, ownerId: session.userId, path: resolvedPath });
+        
+        return { success: true, repo };
+    }
+
+    removeRepository(token, repoId) {
+        const session = this.auth.validateSession(token);
+        if (!session) {
+            return { success: false, error: 'Invalid or expired session' };
+        }
+        
+        const db = this.db.loadDB();
+        const repoIndex = db.repos.findIndex(r => r.id === repoId);
+        
+        if (repoIndex === -1) {
+            return { success: false, error: 'Repository not found' };
+        }
+        
+        // Only owner can remove
+        if (db.repos[repoIndex].ownerId !== session.userId) {
+            return { success: false, error: 'Only the owner can remove this repository' };
+        }
+        
+        db.repos.splice(repoIndex, 1);
+        this.db.saveDB(db);
+        
+        this.db.log('info', 'Repository removed', { repoId, ownerId: session.userId });
+        
+        return { success: true };
+    }
+
+    getUserRepos(userId) {
+        const db = this.db.loadDB();
+        return db.repos.filter(r => r.ownerId === userId);
+    }
+
+    getAllRepos() {
+        const db = this.db.loadDB();
+        return db.repos;
+    }
+
+    getRepoById(repoId) {
+        const db = this.db.loadDB();
+        return db.repos.find(r => r.id === repoId);
+    }
+
+    async analyzeRepo(repoId) {
+        const repo = this.getRepoById(repoId);
+        if (!repo) return null;
+        
+        // Check cache
+        if (this.analysisCache.has(repoId)) {
+            const cached = this.analysisCache.get(repoId);
+            if (Date.now() - cached.timestamp < 5 * 60 * 1000) { // 5 min cache
+                return cached.data;
+            }
+        }
+        
+        try {
+            const gitView = new GitView(repo.path);
+            const gitData = gitView.getAllData();
+            
+            // Run Pack analysis
+            let packAnalysis = null;
+            try {
+                const packResult = await analyzeDirectories(repo.path);
+                packAnalysis = packResult.report || packResult;
+            } catch (error) {
+                console.error(`Pack analysis failed for ${repo.name}: ${error.message}`);
+            }
+            
+            const fullData = {
+                ...gitData,
+                packAnalysis,
+                repository: {
+                    ...gitData.repository,
+                    currentCommit: gitView.executeGitOptional(['rev-parse', 'HEAD'])
+                }
+            };
+            
+            this.analysisCache.set(repoId, {
+                timestamp: Date.now(),
+                data: fullData
+            });
+            
+            return fullData;
+        } catch (error) {
+            console.error(`Failed to analyze repo ${repo.path}: ${error.message}`);
+            return null;
+        }
+    }
+}
+
+// ============================================================================
+// GROUP MANAGER
+// ============================================================================
+
+class GroupManager {
+    constructor(dbManager, authManager) {
+        this.db = dbManager;
+        this.auth = authManager;
+    }
+
+    createGroup(token, name, description = '', repoIds = []) {
+        const session = this.auth.validateSession(token);
+        if (!session) {
+            return { success: false, error: 'Invalid or expired session' };
+        }
+        
+        const db = this.db.loadDB();
+        
+        // Check if group name already exists for this user
+        const existingGroup = db.groups.find(g => g.name === name && g.ownerId === session.userId);
+        if (existingGroup) {
+            return { success: false, error: 'Group with this name already exists' };
+        }
+        
+        const group = {
+            id: crypto.randomUUID(),
+            ownerId: session.userId,
+            name,
+            description,
+            repoIds: repoIds.filter(id => db.repos.some(r => r.id === id)),
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        };
+        
+        db.groups.push(group);
+        this.db.saveDB(db);
+        
+        this.db.log('info', 'Group created', { groupId: group.id, ownerId: session.userId, name });
+        
+        return { success: true, group };
+    }
+
+    addRepoToGroup(token, groupId, repoId) {
+        const session = this.auth.validateSession(token);
+        if (!session) {
+            return { success: false, error: 'Invalid or expired session' };
+        }
+        
+        const db = this.db.loadDB();
+        const group = db.groups.find(g => g.id === groupId);
+        
+        if (!group) {
+            return { success: false, error: 'Group not found' };
+        }
+        
+        if (group.ownerId !== session.userId) {
+            return { success: false, error: 'Only the owner can modify this group' };
+        }
+        
+        if (!group.repoIds.includes(repoId)) {
+            group.repoIds.push(repoId);
+            group.updatedAt = new Date().toISOString();
+            this.db.saveDB(db);
+        }
+        
+        return { success: true, group };
+    }
+
+    removeRepoFromGroup(token, groupId, repoId) {
+        const session = this.auth.validateSession(token);
+        if (!session) {
+            return { success: false, error: 'Invalid or expired session' };
+        }
+        
+        const db = this.db.loadDB();
+        const group = db.groups.find(g => g.id === groupId);
+        
+        if (!group) {
+            return { success: false, error: 'Group not found' };
+        }
+        
+        if (group.ownerId !== session.userId) {
+            return { success: false, error: 'Only the owner can modify this group' };
+        }
+        
+        group.repoIds = group.repoIds.filter(id => id !== repoId);
+        group.updatedAt = new Date().toISOString();
+        this.db.saveDB(db);
+        
+        return { success: true, group };
+    }
+
+    deleteGroup(token, groupId) {
+        const session = this.auth.validateSession(token);
+        if (!session) {
+            return { success: false, error: 'Invalid or expired session' };
+        }
+        
+        const db = this.db.loadDB();
+        const groupIndex = db.groups.findIndex(g => g.id === groupId);
+        
+        if (groupIndex === -1) {
+            return { success: false, error: 'Group not found' };
+        }
+        
+        if (db.groups[groupIndex].ownerId !== session.userId) {
+            return { success: false, error: 'Only the owner can delete this group' };
+        }
+        
+        db.groups.splice(groupIndex, 1);
+        this.db.saveDB(db);
+        
+        return { success: true };
+    }
+
+    getUserGroups(userId) {
+        const db = this.db.loadDB();
+        return db.groups.filter(g => g.ownerId === userId);
+    }
+
+    getAllGroups() {
+        const db = this.db.loadDB();
+        return db.groups;
+    }
+
+    getGroupById(groupId) {
+        const db = this.db.loadDB();
+        return db.groups.find(g => g.id === groupId);
+    }
+}
+
+// ============================================================================
+// CACHE MANAGER (Preserved from original)
 // ============================================================================
 
 class CacheManager {
@@ -122,7 +848,6 @@ class CacheManager {
         const groupsData = this.loadGroups();
         const repoAbs = path.resolve(repoPath);
         
-        // Remove from all groups first (move semantics)
         for (const group of Object.values(groupsData.groups)) {
             const index = group.repos.indexOf(repoAbs);
             if (index > -1) {
@@ -131,7 +856,6 @@ class CacheManager {
             }
         }
         
-        // Add to target group
         if (!groupsData.groups[groupName]) {
             groupsData.groups[groupName] = {
                 name: groupName,
@@ -158,7 +882,6 @@ class CacheManager {
                 groupsData.groups[groupName].repos.splice(index, 1);
                 groupsData.groups[groupName].updatedAt = new Date().toISOString();
                 
-                // Remove group if empty
                 if (groupsData.groups[groupName].repos.length === 0) {
                     delete groupsData.groups[groupName];
                 }
@@ -172,7 +895,7 @@ class CacheManager {
 }
 
 // ============================================================================
-// COMMAND LINE ARGUMENT PARSER
+// COMMAND LINE ARGUMENT PARSER (Enhanced)
 // ============================================================================
 
 class ArgumentParser {
@@ -187,7 +910,14 @@ class ArgumentParser {
             group: null,
             createGroup: null,
             addToGroup: null,
-            compareWith: null
+            compareWith: null,
+            // New management commands
+            clearDB: false,
+            clearLogs: false,
+            toggleLogging: false,
+            showLogs: false,
+            listUsers: false,
+            listRepos: false
         };
         this.parse();
     }
@@ -249,49 +979,89 @@ class ArgumentParser {
                         i++;
                     }
                     break;
+                // Management commands
+                case '--clear-db':
+                    this.args.clearDB = true;
+                    break;
+                case '--clear-logs':
+                    this.args.clearLogs = true;
+                    break;
+                case '--toggle-logging':
+                    this.args.toggleLogging = true;
+                    break;
+                case '--show-logs':
+                    this.args.showLogs = true;
+                    break;
+                case '--list-users':
+                    this.args.listUsers = true;
+                    break;
+                case '--list-repos':
+                    this.args.listRepos = true;
+                    break;
             }
         }
 
-        if (!this.args.html && !this.args.help && !this.args.createGroup && !this.args.addToGroup) {
+        if (!this.args.html && !this.args.help && !this.args.createGroup && 
+            !this.args.addToGroup && !this.args.clearDB && !this.args.clearLogs && 
+            !this.args.toggleLogging && !this.args.showLogs && !this.args.listUsers && 
+            !this.args.listRepos) {
             this.args.server = true;
         }
     }
 
     showHelp() {
         console.log(`
-╔══════════════════════════════════════════════════════════════╗
-║                    GitView - Git Repository Viewer            ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════════╗
+║              GitView - Git Repository Viewer & Manager                ║
+╚══════════════════════════════════════════════════════════════════════╝
 
 USAGE:
     node gitview.js [OPTIONS]
 
-OPTIONS:
+MAIN OPTIONS:
     --help, -h              Show this help message
-    --html                  Generate static HTML file
-    --server                Start web server
+    --server                Start web server with authentication
     --port, -p <number>     Specify port (default: 8080)
     --repo, -r <path>       Specify repository path
     --dir                   Analyze all repositories inside a directory
+    --html                  Generate static HTML file
+
+GROUP OPTIONS:
     --group, -g <name>      Load a specific group of repositories
-    --compare-with <name>   Compare with another group or repo
     --create-group <name>   Create a new group (requires --dir or --repo)
     --add-to-group <name>   Add current repos to existing group
+    --compare-with <name>   Compare with another group or repo
+
+SERVER MANAGEMENT:
+    --clear-db              Clear entire database (users, repos, groups)
+    --clear-logs            Clear all logs
+    --toggle-logging        Toggle logging on/off
+    --show-logs             Display recent logs
+    --list-users            List all registered users
+    --list-repos            List all registered repositories
+
+AUTHENTICATION:
+    The server now requires user authentication.
+    Register at: http://localhost:8080/register
+    Login at: http://localhost:8080/login
+    
+    All repositories are initially PUBLIC.
+    Users can add their git repos after registration.
 
 EXAMPLES:
-    node gitview.js                    # Start server on current repo
-    node gitview.js --html             # Generate gitview.html only
-    node gitview.js --port 3000        # Start server on port 3000
-    node gitview.js --dir /path/to/repos   # Analyze all repos in directory
-    node gitview.js --group my-group   # Load a saved group
-    node gitview.js --compare-with other-group --group my-group
-    node gitview.js --create-group team-repos --dir /path/to/repos
+    node gitview.js                          # Start server with auth
+    node gitview.js --port 3000              # Start server on port 3000
+    node gitview.js --html                   # Generate gitview.html only
+    node gitview.js --dir /path/to/repos     # Analyze repos in directory
+    node gitview.js --toggle-logging         # Enable/disable logging
+    node gitview.js --show-logs              # View recent logs
+    node gitview.js --clear-db               # Reset entire database
         `);
     }
 }
 
 // ============================================================================
-// GITVIEW CORE INTERFACE
+// GITVIEW CORE INTERFACE (Preserved from original)
 // ============================================================================
 
 class GitView {
@@ -745,7 +1515,7 @@ class GitView {
 }
 
 // ============================================================================
-// GROUP ANALYSIS - Aggregates data from multiple repos
+// GROUP ANALYSIS (Preserved from original)
 // ============================================================================
 
 class GroupAnalyzer {
@@ -788,7 +1558,6 @@ class GroupAnalyzer {
             packAnalysis: null
         };
 
-        // Aggregate basic stats
         for (const repo of validRepos) {
             aggregatedData.health.totalCommits += repo.data.health.totalCommits;
             aggregatedData.health.totalBranches += repo.data.health.totalBranches;
@@ -805,33 +1574,28 @@ class GroupAnalyzer {
                 aggregatedData.health.firstCommit = repo.data.health.firstCommit;
             }
             
-            // Aggregate branches
             aggregatedData.branches.push(...repo.data.branches.map(b => ({
                 ...b,
                 repoName: repo.name
             })));
             
-            // Aggregate tags
             aggregatedData.tags.push(...repo.data.tags.map(t => ({
                 ...t,
                 repoName: repo.name
             })));
             
-            // Aggregate commits
             aggregatedData.commits.push(...repo.data.commits.map(c => ({
                 ...c,
                 repoName: repo.name
             })));
         }
 
-        // Calculate days active
         if (aggregatedData.health.firstCommit && aggregatedData.health.lastActivity) {
             const first = new Date(aggregatedData.health.firstCommit);
             const last = new Date(aggregatedData.health.lastActivity);
             aggregatedData.health.daysActive = Math.ceil((last - first) / (1000 * 60 * 60 * 24));
         }
 
-        // Aggregate authors with deduplication
         const authorMap = new Map();
         for (const repo of validRepos) {
             for (const author of repo.data.authors) {
@@ -860,7 +1624,6 @@ class GroupAnalyzer {
         aggregatedData.authors = Array.from(authorMap.values());
         aggregatedData.health.contributors = aggregatedData.authors.length;
 
-        // Aggregate monthly data
         for (const repo of validRepos) {
             for (const [key, data] of Object.entries(repo.data.commitsByMonth)) {
                 if (!aggregatedData.commitsByMonth[key]) {
@@ -884,13 +1647,11 @@ class GroupAnalyzer {
             }
         }
 
-        // Convert Sets to arrays for monthly data
         for (const key in aggregatedData.commitsByMonth) {
             aggregatedData.commitsByMonth[key].authors = Array.from(aggregatedData.commitsByMonth[key].authors);
             aggregatedData.commitsByMonth[key].authorsCount = aggregatedData.commitsByMonth[key].authors.length;
         }
 
-        // Aggregate yearly data
         for (const repo of validRepos) {
             for (const [year, data] of Object.entries(repo.data.yearlySummary)) {
                 if (!aggregatedData.yearlySummary[year]) {
@@ -918,13 +1679,11 @@ class GroupAnalyzer {
             }
         }
 
-        // Convert Sets to arrays for yearly data
         for (const year in aggregatedData.yearlySummary) {
             aggregatedData.yearlySummary[year].authors = Array.from(aggregatedData.yearlySummary[year].authors);
             aggregatedData.yearlySummary[year].authorsCount = aggregatedData.yearlySummary[year].authors.length;
         }
 
-        // Sort commits by date
         aggregatedData.commits.sort((a, b) => new Date(b.authorDate) - new Date(a.authorDate));
         aggregatedData.commits = aggregatedData.commits.slice(0, 500);
 
@@ -953,7 +1712,7 @@ class GroupAnalyzer {
 }
 
 // ============================================================================
-// LOADING PAGE GENERATOR
+// LOADING PAGE GENERATOR (Preserved from original)
 // ============================================================================
 
 class LoadingPageGenerator {
@@ -1253,10 +2012,990 @@ class LoadingPageGenerator {
 }
 
 // ============================================================================
-// HTML TEMPLATE GENERATOR - With Complete Pack.js Data
+// HTML TEMPLATE GENERATOR - Enhanced with Authentication UI
 // ============================================================================
 
 class HTMLGenerator {
+   
+    static generateLoginPage() {
+        return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>GitView - Login</title>
+        <style>
+            :root {
+                --bg-primary: #0d1117;
+                --bg-secondary: #161b22;
+                --bg-tertiary: #21262d;
+                --text-primary: #c9d1d9;
+                --text-secondary: #8b949e;
+                --accent: #58a6ff;
+                --success: #3fb950;
+                --danger: #f85149;
+                --border: #30363d;
+            }
+    
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+    
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+                background: var(--bg-primary);
+                color: var(--text-primary);
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+            }
+    
+            .auth-container {
+                background: var(--bg-secondary);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 40px;
+                max-width: 400px;
+                width: 90%;
+            }
+    
+            .auth-header {
+                text-align: center;
+                margin-bottom: 30px;
+            }
+    
+            .auth-header h1 {
+                color: var(--accent);
+                font-size: 28px;
+                margin-bottom: 10px;
+            }
+    
+            .auth-header p {
+                color: var(--text-secondary);
+                font-size: 14px;
+            }
+    
+            .form-group {
+                margin-bottom: 20px;
+            }
+    
+            .form-group label {
+                display: block;
+                margin-bottom: 5px;
+                color: var(--text-secondary);
+                font-size: 14px;
+            }
+    
+            .form-group input {
+                width: 100%;
+                padding: 10px 15px;
+                background: var(--bg-tertiary);
+                color: var(--text-primary);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                font-size: 14px;
+            }
+    
+            .form-group input:focus {
+                outline: none;
+                border-color: var(--accent);
+            }
+    
+            .btn {
+                width: 100%;
+                padding: 10px;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 16px;
+                font-weight: bold;
+                transition: all 0.3s;
+            }
+    
+            .btn-primary {
+                background: var(--accent);
+                color: var(--bg-primary);
+            }
+    
+            .btn-primary:hover {
+                background: #79c0ff;
+            }
+    
+            .auth-link {
+                text-align: center;
+                margin-top: 20px;
+                color: var(--text-secondary);
+                font-size: 14px;
+            }
+    
+            .auth-link a {
+                color: var(--accent);
+                text-decoration: none;
+            }
+    
+            .auth-link a:hover {
+                text-decoration: underline;
+            }
+    
+            .error-message {
+                background: var(--danger);
+                color: white;
+                padding: 10px;
+                border-radius: 6px;
+                margin-bottom: 20px;
+                display: none;
+            }
+    
+            .success-message {
+                background: var(--success);
+                color: white;
+                padding: 10px;
+                border-radius: 6px;
+                margin-bottom: 20px;
+                display: none;
+            }
+    
+            .loading-spinner {
+                display: inline-block;
+                width: 20px;
+                height: 20px;
+                border: 3px solid rgba(255,255,255,0.3);
+                border-radius: 50%;
+                border-top-color: #fff;
+                animation: spin 1s ease-in-out infinite;
+                margin-right: 10px;
+            }
+    
+            @keyframes spin {
+                to { transform: rotate(360deg); }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="auth-container">
+            <div class="auth-header">
+                <h1>🚀 GitView</h1>
+                <p>Login to your account</p>
+            </div>
+    
+            <div class="error-message" id="errorMessage"></div>
+            <div class="success-message" id="successMessage"></div>
+    
+            <form id="loginForm" onsubmit="return false;">
+                <div class="form-group">
+                    <label for="email">Email</label>
+                    <input type="email" id="email" name="email" required autocomplete="email">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" required autocomplete="current-password">
+                </div>
+                <button type="submit" class="btn btn-primary" id="loginButton">
+                    <span id="buttonText">Login</span>
+                </button>
+            </form>
+    
+            <div class="auth-link">
+                Don't have an account? <a href="/register">Register here</a>
+            </div>
+        </div>
+    
+        <script>
+            // Check for registration success message
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.get('registered') === 'true') {
+                const successMessage = document.getElementById('successMessage');
+                successMessage.textContent = 'Registration successful! Please login.';
+                successMessage.style.display = 'block';
+            }
+    
+            document.getElementById('loginForm').addEventListener('submit', async function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                
+                const email = document.getElementById('email').value.trim();
+                const password = document.getElementById('password').value;
+                const errorMessage = document.getElementById('errorMessage');
+                const successMessage = document.getElementById('successMessage');
+                const loginButton = document.getElementById('loginButton');
+                const buttonText = document.getElementById('buttonText');
+                
+                // Clear previous messages
+                errorMessage.style.display = 'none';
+                successMessage.style.display = 'none';
+                
+                // Validate inputs
+                if (!email || !password) {
+                    errorMessage.textContent = 'Please enter both email and password';
+                    errorMessage.style.display = 'block';
+                    return;
+                }
+                
+                // Show loading state
+                loginButton.disabled = true;
+                buttonText.innerHTML = '<span class="loading-spinner"></span>Logging in...';
+                
+                try {
+                    console.log('Attempting login with email:', email);
+                    
+                    const response = await fetch('/api/auth/login', {
+                        method: 'POST',
+                        headers: { 
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
+                        },
+                        body: JSON.stringify({ email, password })
+                    });
+                    
+                    console.log('Response status:', response.status);
+                    
+                    const data = await response.json();
+                    console.log('Response data:', data);
+                    
+                    if (data.success) {
+                        // Store token and user info
+                        localStorage.setItem('gitview_token', data.token);
+                        localStorage.setItem('gitview_user', JSON.stringify(data.user));
+                        
+                        // Set cookie for server-side auth
+                        document.cookie = 'gitview_token=' + data.token + '; path=/; max-age=604800';
+                        
+                        // Show success message
+                        successMessage.textContent = 'Login successful! Redirecting...';
+                        successMessage.style.display = 'block';
+                        
+                        // Redirect to dashboard
+                        setTimeout(() => {
+                            window.location.href = '/dashboard';
+                        }, 500);
+                    } else {
+                        errorMessage.textContent = data.error || 'Login failed';
+                        errorMessage.style.display = 'block';
+                        
+                        // Reset button
+                        loginButton.disabled = false;
+                        buttonText.textContent = 'Login';
+                    }
+                } catch (error) {
+                    console.error('Login error:', error);
+                    errorMessage.textContent = 'Network error. Please check your connection and try again.';
+                    errorMessage.style.display = 'block';
+                    
+                    // Reset button
+                    loginButton.disabled = false;
+                    buttonText.textContent = 'Login';
+                }
+            });
+    
+            // Prevent form from submitting on Enter key
+            document.getElementById('loginForm').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    const submitEvent = new Event('submit', { bubbles: true, cancelable: true });
+                    this.dispatchEvent(submitEvent);
+                }
+            });
+        </script>
+    </body>
+    </html>`;
+    }
+
+    static generateRegisterPage() {
+        return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>GitView - Register</title>
+        <style>
+            :root {
+                --bg-primary: #0d1117;
+                --bg-secondary: #161b22;
+                --bg-tertiary: #21262d;
+                --text-primary: #c9d1d9;
+                --text-secondary: #8b949e;
+                --accent: #58a6ff;
+                --success: #3fb950;
+                --danger: #f85149;
+                --border: #30363d;
+            }
+    
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+    
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+                background: var(--bg-primary);
+                color: var(--text-primary);
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+            }
+    
+            .auth-container {
+                background: var(--bg-secondary);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 40px;
+                max-width: 400px;
+                width: 90%;
+            }
+    
+            .auth-header {
+                text-align: center;
+                margin-bottom: 30px;
+            }
+    
+            .auth-header h1 {
+                color: var(--accent);
+                font-size: 28px;
+                margin-bottom: 10px;
+            }
+    
+            .auth-header p {
+                color: var(--text-secondary);
+                font-size: 14px;
+            }
+    
+            .form-group {
+                margin-bottom: 20px;
+            }
+    
+            .form-group label {
+                display: block;
+                margin-bottom: 5px;
+                color: var(--text-secondary);
+                font-size: 14px;
+            }
+    
+            .form-group input {
+                width: 100%;
+                padding: 10px 15px;
+                background: var(--bg-tertiary);
+                color: var(--text-primary);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                font-size: 14px;
+            }
+    
+            .form-group input:focus {
+                outline: none;
+                border-color: var(--accent);
+            }
+    
+            .btn {
+                width: 100%;
+                padding: 10px;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 16px;
+                font-weight: bold;
+                transition: all 0.3s;
+            }
+    
+            .btn-primary {
+                background: var(--accent);
+                color: var(--bg-primary);
+            }
+    
+            .btn-primary:hover {
+                background: #79c0ff;
+            }
+    
+            .auth-link {
+                text-align: center;
+                margin-top: 20px;
+                color: var(--text-secondary);
+                font-size: 14px;
+            }
+    
+            .auth-link a {
+                color: var(--accent);
+                text-decoration: none;
+            }
+    
+            .auth-link a:hover {
+                text-decoration: underline;
+            }
+    
+            .error-message {
+                background: var(--danger);
+                color: white;
+                padding: 10px;
+                border-radius: 6px;
+                margin-bottom: 20px;
+                display: none;
+            }
+    
+            .loading-spinner {
+                display: inline-block;
+                width: 20px;
+                height: 20px;
+                border: 3px solid rgba(255,255,255,0.3);
+                border-radius: 50%;
+                border-top-color: #fff;
+                animation: spin 1s ease-in-out infinite;
+                margin-right: 10px;
+            }
+    
+            @keyframes spin {
+                to { transform: rotate(360deg); }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="auth-container">
+            <div class="auth-header">
+                <h1>🚀 GitView</h1>
+                <p>Create your account</p>
+            </div>
+    
+            <div class="error-message" id="errorMessage"></div>
+    
+            <form id="registerForm" onsubmit="return false;">
+                <div class="form-group">
+                    <label for="name">Name</label>
+                    <input type="text" id="name" name="name" required autocomplete="name">
+                </div>
+                <div class="form-group">
+                    <label for="email">Email</label>
+                    <input type="email" id="email" name="email" required autocomplete="email">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" minlength="6" required autocomplete="new-password">
+                </div>
+                <div class="form-group">
+                    <label for="confirmPassword">Confirm Password</label>
+                    <input type="password" id="confirmPassword" name="confirmPassword" minlength="6" required autocomplete="new-password">
+                </div>
+                <button type="submit" class="btn btn-primary" id="registerButton">
+                    <span id="buttonText">Register</span>
+                </button>
+            </form>
+    
+            <div class="auth-link">
+                Already have an account? <a href="/login">Login here</a>
+            </div>
+        </div>
+    
+        <script>
+            document.getElementById('registerForm').addEventListener('submit', async function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                
+                const name = document.getElementById('name').value.trim();
+                const email = document.getElementById('email').value.trim();
+                const password = document.getElementById('password').value;
+                const confirmPassword = document.getElementById('confirmPassword').value;
+                const errorMessage = document.getElementById('errorMessage');
+                const registerButton = document.getElementById('registerButton');
+                const buttonText = document.getElementById('buttonText');
+                
+                // Clear previous messages
+                errorMessage.style.display = 'none';
+                
+                // Validate inputs
+                if (!name || !email || !password || !confirmPassword) {
+                    errorMessage.textContent = 'Please fill in all fields';
+                    errorMessage.style.display = 'block';
+                    return;
+                }
+                
+                if (password !== confirmPassword) {
+                    errorMessage.textContent = 'Passwords do not match';
+                    errorMessage.style.display = 'block';
+                    return;
+                }
+                
+                if (password.length < 6) {
+                    errorMessage.textContent = 'Password must be at least 6 characters';
+                    errorMessage.style.display = 'block';
+                    return;
+                }
+                
+                // Show loading state
+                registerButton.disabled = true;
+                buttonText.innerHTML = '<span class="loading-spinner"></span>Registering...';
+                
+                try {
+                    console.log('Attempting registration with email:', email);
+                    
+                    const response = await fetch('/api/auth/register', {
+                        method: 'POST',
+                        headers: { 
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
+                        },
+                        body: JSON.stringify({ name, email, password })
+                    });
+                    
+                    console.log('Response status:', response.status);
+                    
+                    const data = await response.json();
+                    console.log('Response data:', data);
+                    
+                    if (data.success) {
+                        // Redirect to login with success message
+                        window.location.href = '/login?registered=true';
+                    } else {
+                        errorMessage.textContent = data.error || 'Registration failed';
+                        errorMessage.style.display = 'block';
+                        
+                        // Reset button
+                        registerButton.disabled = false;
+                        buttonText.textContent = 'Register';
+                    }
+                } catch (error) {
+                    console.error('Registration error:', error);
+                    errorMessage.textContent = 'Network error. Please check your connection and try again.';
+                    errorMessage.style.display = 'block';
+                    
+                    // Reset button
+                    registerButton.disabled = false;
+                    buttonText.textContent = 'Register';
+                }
+            });
+        </script>
+    </body>
+    </html>`;
+    }
+
+    static generateDashboard(user, repos, groups) {
+        return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GitView - Dashboard</title>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --accent: #58a6ff;
+            --success: #3fb950;
+            --danger: #f85149;
+            --border: #30363d;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header h1 {
+            color: var(--accent);
+        }
+
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 14px;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: var(--bg-primary);
+            border-color: var(--accent);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+            border-color: var(--danger);
+        }
+
+        .btn-success {
+            background: var(--success);
+            color: white;
+            border-color: var(--success);
+        }
+
+        .repos-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+
+        .repo-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            transition: transform 0.2s;
+        }
+
+        .repo-card:hover {
+            transform: translateY(-2px);
+            border-color: var(--accent);
+        }
+
+        .repo-name {
+            color: var(--accent);
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .repo-path {
+            color: var(--text-secondary);
+            font-size: 12px;
+            margin-bottom: 15px;
+        }
+
+        .repo-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .groups-section {
+            margin-top: 30px;
+        }
+
+        .groups-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+
+        .group-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 15px;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+
+        .modal-content {
+            background: var(--bg-secondary);
+            margin: 5% auto;
+            padding: 20px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            width: 80%;
+            max-width: 500px;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .close {
+            color: var(--text-secondary);
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: var(--text-secondary);
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 8px 12px;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 GitView Dashboard</h1>
+            <div class="user-info">
+                <span>Welcome, ${user.name}</span>
+                <button class="btn btn-danger" onclick="logout()">Logout</button>
+            </div>
+        </div>
+
+        <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+            <button class="btn btn-primary" onclick="openAddRepoModal()">➕ Add Repository</button>
+            <button class="btn btn-success" onclick="openCreateGroupModal()">📦 Create Group</button>
+        </div>
+
+        <h2>Your Repositories</h2>
+        <div class="repos-grid">
+            ${repos.length > 0 ? repos.map(repo => `
+                <div class="repo-card">
+                    <div class="repo-name">${repo.name}</div>
+                    <div class="repo-path">${repo.path}</div>
+                    <div class="repo-actions">
+                        <button class="btn btn-primary" onclick="viewRepo('${repo.id}')">View</button>
+                        <button class="btn btn-danger" onclick="removeRepo('${repo.id}')">Remove</button>
+                    </div>
+                </div>
+            `).join('') : '<p style="color: var(--text-secondary);">No repositories yet. Add your first repo!</p>'}
+        </div>
+
+        <div class="groups-section">
+            <h2>Your Groups</h2>
+            <div class="groups-grid">
+                ${groups.length > 0 ? groups.map(group => `
+                    <div class="group-card">
+                        <div style="color: var(--accent); font-weight: bold;">${group.name}</div>
+                        <div style="color: var(--text-secondary); font-size: 12px;">${group.description || 'No description'}</div>
+                        <div style="color: var(--text-secondary); font-size: 12px; margin: 10px 0;">${group.repoIds.length} repos</div>
+                        <div class="repo-actions">
+                            <button class="btn btn-primary" onclick="viewGroup('${group.id}')">View</button>
+                            <button class="btn btn-danger" onclick="deleteGroup('${group.id}')">Delete</button>
+                        </div>
+                    </div>
+                `).join('') : '<p style="color: var(--text-secondary);">No groups yet.</p>'}
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Repo Modal -->
+    <div id="addRepoModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>➕ Add Repository</h2>
+                <span class="close" onclick="closeAddRepoModal()">&times;</span>
+            </div>
+            <div class="form-group">
+                <label>Repository Path</label>
+                <input type="text" id="repoPath" placeholder="/path/to/your/repo">
+            </div>
+            <div class="form-group">
+                <label>Name (optional)</label>
+                <input type="text" id="repoName" placeholder="My Repo">
+            </div>
+            <div class="form-group">
+                <label>Description (optional)</label>
+                <input type="text" id="repoDescription" placeholder="Description">
+            </div>
+            <button class="btn btn-primary" onclick="addRepo()">Add Repository</button>
+        </div>
+    </div>
+
+    <!-- Create Group Modal -->
+    <div id="createGroupModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>📦 Create Group</h2>
+                <span class="close" onclick="closeCreateGroupModal()">&times;</span>
+            </div>
+            <div class="form-group">
+                <label>Group Name</label>
+                <input type="text" id="groupName" placeholder="My Group">
+            </div>
+            <div class="form-group">
+                <label>Description (optional)</label>
+                <input type="text" id="groupDescription" placeholder="Description">
+            </div>
+            <div class="form-group">
+                <label>Select Repositories</label>
+                <div id="repoCheckboxes">
+                    ${repos.map(repo => `
+                        <label style="display: block; margin: 5px 0;">
+                            <input type="checkbox" value="${repo.id}"> ${repo.name}
+                        </label>
+                    `).join('')}
+                </div>
+            </div>
+            <button class="btn btn-success" onclick="createGroup()">Create Group</button>
+        </div>
+    </div>
+
+    <script>
+        const token = localStorage.getItem('gitview_token');
+        
+        function logout() {
+            fetch('/api/auth/logout', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token })
+            }).then(() => {
+                localStorage.removeItem('gitview_token');
+                localStorage.removeItem('gitview_user');
+                window.location.href = '/login';
+            });
+        }
+
+        function openAddRepoModal() {
+            document.getElementById('addRepoModal').style.display = 'block';
+        }
+
+        function closeAddRepoModal() {
+            document.getElementById('addRepoModal').style.display = 'none';
+        }
+
+        function openCreateGroupModal() {
+            document.getElementById('createGroupModal').style.display = 'block';
+        }
+
+        function closeCreateGroupModal() {
+            document.getElementById('createGroupModal').style.display = 'none';
+        }
+
+        function addRepo() {
+            const path = document.getElementById('repoPath').value;
+            const name = document.getElementById('repoName').value;
+            const description = document.getElementById('repoDescription').value;
+            
+            fetch('/api/repos', {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + token
+                },
+                body: JSON.stringify({ path, name, description })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Failed to add repo: ' + data.error);
+                }
+            });
+        }
+
+        function removeRepo(repoId) {
+            if (confirm('Remove this repository?')) {
+                fetch('/api/repos/' + repoId, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': 'Bearer ' + token }
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        location.reload();
+                    } else {
+                        alert('Failed to remove repo: ' + data.error);
+                    }
+                });
+            }
+        }
+
+        function createGroup() {
+            const name = document.getElementById('groupName').value;
+            const description = document.getElementById('groupDescription').value;
+            const repoIds = [];
+            
+            document.querySelectorAll('#repoCheckboxes input:checked').forEach(cb => {
+                repoIds.push(cb.value);
+            });
+            
+            fetch('/api/groups', {
+                method: 'POST',
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + token
+                },
+                body: JSON.stringify({ name, description, repoIds })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Failed to create group: ' + data.error);
+                }
+            });
+        }
+
+        function deleteGroup(groupId) {
+            if (confirm('Delete this group?')) {
+                fetch('/api/groups/' + groupId, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': 'Bearer ' + token }
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        location.reload();
+                    } else {
+                        alert('Failed to delete group: ' + data.error);
+                    }
+                });
+            }
+        }
+
+        function viewRepo(repoId) {
+            window.location.href = '/repo/' + repoId;
+        }
+
+        function viewGroup(groupId) {
+            window.location.href = '/group/' + groupId;
+        }
+    </script>
+</body>
+</html>`;
+    }
+
     static generateHTML(data, options = {}) {
         const { repoList = [], currentIndex = 0, groups = [], currentGroup = null, comparisonTargets = [], ungroupedRepos = [] } = options;
         const hasMultiple = repoList.length > 1;
@@ -1271,7 +3010,6 @@ class HTMLGenerator {
         const maxMonthlyCommits = Math.max(...monthlyKeys.map(key => monthlyData[key].commitCount), 1);
         const maxYearlyCommits = Math.max(...yearlyKeys.map(key => yearlyData[key].commitCount), 1);
 
-        // Extract Pack.js data
         const packSizeData = packData?.['Total Size Analyzer'] || {};
         const packLocData = packData?.['Lines of Code Analyzer'] || {};
         const packArchiveData = packData?.['Archive Files Analyzer'] || {};
@@ -1279,7 +3017,6 @@ class HTMLGenerator {
         const packPkgData = packData?.['Package.json Analyzer'] || {};
         const packGitData = packData?.['Git Analyzer'] || {};
 
-        // Get language data for display
         const languages = packLocData.languages || [];
 
         return `
@@ -1874,7 +3611,7 @@ class HTMLGenerator {
 <body>
     <div class="container">
         <div class="nav-bar fade-in">
-            <a href="/" class="nav-link">🏠 Home</a>
+            <a href="/dashboard" class="nav-link">🏠 Dashboard</a>
             ${hasMultiple ? `<a href="/compare" class="nav-link">🔍 Comparison</a>` : ''}
             <button class="nav-link" onclick="openGroupsModal()">📦 Groups</button>
             <button class="nav-link" onclick="openNewGroupModal()">➕ New Group</button>
@@ -2018,6 +3755,14 @@ class HTMLGenerator {
                 <div class="pack-item">
                     <h4>📝 Total Commits (Pack)</h4>
                     <p>${packGitData.totalCommits || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>📊 Pure Code Added</h4>
+                    <p>${packGitData.totalPureCodeAddedFormatted || 'N/A'}</p>
+                </div>
+                <div class="pack-item">
+                    <h4>⚡ Avg Pure Code/Commit</h4>
+                    <p>${packGitData.averagePureCodeAddedPerCommitFormatted || 'N/A'}</p>
                 </div>
             </div>
         </div>
@@ -2337,7 +4082,6 @@ class HTMLGenerator {
         const repos = repoDataList.filter(r => r.data);
         if (repos.length < 2) return '<html><body>Need at least 2 repos for comparison</body></html>';
 
-        // Extract pack data for comparison
         const packMetrics = {};
         if (packComparison) {
             repos.forEach(repo => {
@@ -2360,13 +4104,14 @@ class HTMLGenerator {
                         dirCount: packData['Total Size Analyzer']?.dirCount || 'N/A',
                         binaryFiles: packData['Binary Files Analyzer']?.totalCount || 'N/A',
                         archiveFiles: packData['Archive Files Analyzer']?.totalCount || 'N/A',
+                        pureCodeAdded: packData['Git Analyzer']?.totalPureCodeAddedFormatted || 'N/A',
+                        avgPureCodePerCommit: packData['Git Analyzer']?.averagePureCodeAddedPerCommitFormatted || 'N/A',
                         languages: packData['Lines of Code Analyzer']?.languages || []
                     };
                 }
             });
         }
 
-        // Get all unique languages across repos
         const allLanguages = new Set();
         repos.forEach(repo => {
             const languages = packMetrics[repo.name]?.languages || [];
@@ -2541,7 +4286,7 @@ class HTMLGenerator {
 <body>
     <div class="container">
         <div class="nav-bar">
-            <a href="/" class="nav-link">🏠 Home</a>
+            <a href="/dashboard" class="nav-link">🏠 Dashboard</a>
             <a href="/view?repo=0" class="nav-link">📊 Single View</a>
             <a href="/compare" class="nav-link active">🔍 Comparison</a>
         </div>
@@ -2650,6 +4395,14 @@ class HTMLGenerator {
                         <td>Archive Files</td>
                         ${repos.map(r => `<td>${packMetrics[r.name]?.archiveFiles || 'N/A'}</td>`).join('')}
                     </tr>
+                    <tr>
+                        <td>Pure Code Added</td>
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.pureCodeAdded || 'N/A'}</td>`).join('')}
+                    </tr>
+                    <tr>
+                        <td>Avg Pure Code/Commit</td>
+                        ${repos.map(r => `<td>${packMetrics[r.name]?.avgPureCodePerCommit || 'N/A'}</td>`).join('')}
+                    </tr>
                     ` : ''}
 
                     ${packComparison && allLanguages.size > 0 ? `
@@ -2676,55 +4429,19 @@ class HTMLGenerator {
 }
 
 // ============================================================================
-// WEB SERVER WITH PROGRESS TRACKING AND GROUP MANAGEMENT
+// WEB SERVER WITH AUTHENTICATION
 // ============================================================================
 
 class GitViewServer {
-    constructor(repoInput, port = 8080, cacheManager = null) {
-        this.cacheManager = cacheManager || new CacheManager();
+    constructor(port = 8080) {
         this.port = port;
-        this.repoPaths = this.resolveRepoPaths(repoInput);
         this.server = null;
-        this.progress = {
-            stage: 'initializing',
-            percent: 0,
-            message: 'Starting analysis...',
-            repoIndex: 0,
-            totalRepos: this.repoPaths.length,
-            repoName: '',
-            redirectUrl: '/view'
-        };
-        this.analysisMap = new Map();
-        this.repoDataList = [];
-        this.analysisData = null;
-        this.analysisComplete = false;
-        this.isAnalyzing = false;
+        this.dbManager = new DatabaseManager();
+        this.authManager = new AuthManager(this.dbManager);
+        this.repoManager = new RepositoryManager(this.dbManager, this.authManager);
+        this.groupManager = new GroupManager(this.dbManager, this.authManager);
+        this.cacheManager = new CacheManager();
         this.workerPath = this.prepareWorkerFile();
-        this.currentGroup = null;
-        this.groups = this.cacheManager.getAllGroups();
-    }
-
-    resolveRepoPaths(repoInput) {
-        if (Array.isArray(repoInput)) {
-            return repoInput.map(p => path.resolve(p));
-        }
-        if (typeof repoInput === 'string') {
-            return [path.resolve(repoInput)];
-        }
-        if (repoInput && repoInput.repoPath) {
-            return [path.resolve(repoInput.repoPath)];
-        }
-        if (repoInput && repoInput.group) {
-            this.currentGroup = repoInput.group;
-            const groupData = this.cacheManager.loadGroup(repoInput.group);
-            if (groupData) {
-                return groupData.repos;
-            }
-        }
-        if (repoInput && repoInput.repos) {
-            return repoInput.repos.map(p => path.resolve(p));
-        }
-        throw new Error('Invalid repository input. Expected string, array, group, or GitView instance.');
     }
 
     prepareWorkerFile() {
@@ -2746,494 +4463,341 @@ try {
         return workerPath;
     }
 
-    start() {
-        this.server = http.createServer((req, res) => {
-            const parsedUrl = parseUrl(req.url, true);
-            
-            // Serve loading page initially
-            if (parsedUrl.pathname === '/') {
-                if (!this.analysisComplete) {
-                    if (!this.isAnalyzing) {
-                        const repoName = this.repoPaths.length === 1 
-                            ? path.basename(this.repoPaths[0]) 
-                            : `${this.repoPaths.length} repositories`;
-                        const loadingHTML = LoadingPageGenerator.generateLoadingHTML(repoName, !!this.currentGroup);
-                        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                        res.end(loadingHTML);
-                        
-                        this.startAnalysis().catch(err => {
-                            console.error('Analysis failed:', err);
-                            this.progress = { 
-                                stage:'error', 
-                                percent:100, 
-                                message:err.message, 
-                                repoIndex:0,
-                                totalRepos:this.repoPaths.length,
-                                repoName:'',
-                                redirectUrl: '/view'
-                            };
-                        });
-                    } else {
-                        const repoName = this.repoPaths.length === 1 
-                            ? path.basename(this.repoPaths[0]) 
-                            : `${this.repoPaths.length} repositories`;
-                        const loadingHTML = LoadingPageGenerator.generateLoadingHTML(repoName, !!this.currentGroup);
-                        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                        res.end(loadingHTML);
-                    }
-                } else {
-                    const redirectUrl = this.repoPaths.length > 1 ? '/view?repo=0' : '/view';
-                    res.writeHead(302, { 'Location': redirectUrl });
-                    res.end();
-                }
-            } 
-            // Serve the main view
-            else if (parsedUrl.pathname === '/view') {
-                if (!this.analysisComplete) {
-                    res.writeHead(302, { 'Location': '/' });
-                    res.end();
-                    return;
-                }
+    parseCookies(req) {
+        const cookieHeader = req.headers.cookie;
+        if (!cookieHeader) return {};
+        
+        const cookies = {};
+        cookieHeader.split(';').forEach(cookie => {
+            const [name, ...value] = cookie.trim().split('=');
+            cookies[name] = value.join('=');
+        });
+        
+        return cookies;
+    }
 
-                let repoIndex = 0;
-                if (parsedUrl.query.repo !== undefined) {
-                    repoIndex = parseInt(parsedUrl.query.repo, 10);
-                    if (isNaN(repoIndex) || repoIndex < 0 || repoIndex >= this.repoDataList.length) {
-                        repoIndex = 0;
-                    }
+    getAuthToken(req) {
+        // Check Authorization header
+        const authHeader = req.headers.authorization;
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+            return authHeader.substring(7);
+        }
+        
+        // Check cookies
+        const cookies = this.parseCookies(req);
+        return cookies.gitview_token || null;
+    }
+
+    sendJSON(res, statusCode, data) {
+        res.writeHead(statusCode, { 
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+        });
+        res.end(JSON.stringify(data, null, 2));
+    }
+
+    sendHTML(res, html) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(html);
+    }
+
+    async analyzeRepoData(repoPath) {
+        try {
+            const gitView = new GitView(repoPath);
+            const gitData = gitView.getAllData();
+            
+            let packAnalysis = null;
+            try {
+                const packResult = await analyzeDirectories(repoPath);
+                packAnalysis = packResult.report || packResult;
+            } catch (error) {
+                console.error(`Pack analysis failed for ${repoPath}: ${error.message}`);
+            }
+            
+            return {
+                ...gitData,
+                packAnalysis,
+                repository: {
+                    ...gitData.repository,
+                    currentCommit: gitView.executeGitOptional(['rev-parse', 'HEAD'])
                 }
-                const repoEntry = this.repoDataList[repoIndex];
-                if (!repoEntry || !repoEntry.data) {
+            };
+        } catch (error) {
+            console.error(`Failed to analyze ${repoPath}: ${error.message}`);
+            return null;
+        }
+    }
+
+    start() {
+        this.server = http.createServer(async (req, res) => {
+            const parsedUrl = parseUrl(req.url, true);
+            const pathname = parsedUrl.pathname;
+            const method = req.method;
+            
+            // Handle CORS preflight
+            if (method === 'OPTIONS') {
+                this.sendJSON(res, 200, {});
+                return;
+            }
+            
+            // Public routes
+            if (pathname === '/login' && method === 'GET') {
+                this.sendHTML(res, HTMLGenerator.generateLoginPage());
+                return;
+            }
+            
+            if (pathname === '/register' && method === 'GET') {
+                this.sendHTML(res, HTMLGenerator.generateRegisterPage());
+                return;
+            }
+            
+            // Auth API routes
+            if (pathname === '/api/auth/register' && method === 'POST') {
+                let body = '';
+                req.on('data', chunk => { body += chunk; });
+                req.on('end', () => {
+                    try {
+                        const data = JSON.parse(body);
+                        const result = this.authManager.register(data.email, data.password, data.name);
+                        this.sendJSON(res, result.success ? 200 : 400, result);
+                    } catch (error) {
+                        this.sendJSON(res, 400, { success: false, error: error.message });
+                    }
+                });
+                return;
+            }
+            
+            if (pathname === '/api/auth/login' && method === 'POST') {
+                let body = '';
+                req.on('data', chunk => { body += chunk; });
+                req.on('end', () => {
+                    try {
+                        const data = JSON.parse(body);
+                        const result = this.authManager.login(data.email, data.password);
+                        this.sendJSON(res, result.success ? 200 : 401, result);
+                    } catch (error) {
+                        this.sendJSON(res, 400, { success: false, error: error.message });
+                    }
+                });
+                return;
+            }
+            
+            if (pathname === '/api/auth/logout' && method === 'POST') {
+                let body = '';
+                req.on('data', chunk => { body += chunk; });
+                req.on('end', () => {
+                    try {
+                        const data = JSON.parse(body);
+                        const result = this.authManager.logout(data.token);
+                        this.sendJSON(res, 200, result);
+                    } catch (error) {
+                        this.sendJSON(res, 400, { success: false, error: error.message });
+                    }
+                });
+                return;
+            }
+            
+            // Protected routes - require authentication
+            const token = this.getAuthToken(req);
+            const session = this.authManager.validateSession(token);
+            
+            if (!session) {
+                if (pathname.startsWith('/api/')) {
+                    this.sendJSON(res, 401, { success: false, error: 'Authentication required' });
+                } else {
+                    res.writeHead(302, { 'Location': '/login' });
+                    res.end();
+                }
+                return;
+            }
+            
+            const user = this.authManager.getUserById(session.userId);
+            
+            // Dashboard
+            if (pathname === '/dashboard' && method === 'GET') {
+                const repos = this.repoManager.getUserRepos(user.id);
+                const groups = this.groupManager.getUserGroups(user.id);
+                this.sendHTML(res, HTMLGenerator.generateDashboard(user, repos, groups));
+                return;
+            }
+            
+            // Repository API
+            if (pathname === '/api/repos' && method === 'GET') {
+                const repos = this.repoManager.getUserRepos(user.id);
+                this.sendJSON(res, 200, { success: true, repos });
+                return;
+            }
+            
+            if (pathname === '/api/repos' && method === 'POST') {
+                let body = '';
+                req.on('data', chunk => { body += chunk; });
+                req.on('end', () => {
+                    try {
+                        const data = JSON.parse(body);
+                        const result = this.repoManager.addRepository(token, data.path, data.name, data.description);
+                        this.sendJSON(res, result.success ? 200 : 400, result);
+                    } catch (error) {
+                        this.sendJSON(res, 400, { success: false, error: error.message });
+                    }
+                });
+                return;
+            }
+            
+            if (pathname.startsWith('/api/repos/') && method === 'DELETE') {
+                const repoId = pathname.replace('/api/repos/', '');
+                const result = this.repoManager.removeRepository(token, repoId);
+                this.sendJSON(res, result.success ? 200 : 400, result);
+                return;
+            }
+            
+            // View repo
+            if (pathname.startsWith('/repo/') && method === 'GET') {
+                const repoId = pathname.replace('/repo/', '');
+                const repo = this.repoManager.getRepoById(repoId);
+                
+                if (!repo) {
                     res.writeHead(404, { 'Content-Type': 'text/plain' });
-                    res.end('Repository data not found');
+                    res.end('Repository not found');
                     return;
                 }
                 
-                // Get comparison targets (other repos and groups)
-                const comparisonTargets = [];
-                this.repoDataList.forEach((r, i) => {
-                    if (i !== repoIndex) {
-                        comparisonTargets.push({ type: 'repo', name: i.toString() });
-                    }
-                });
-                this.cacheManager.getAllGroups().forEach(g => {
-                    comparisonTargets.push({ type: 'group', name: g.name });
-                });
-                
-                // Get ungrouped repos (not in any group)
-                const groupedRepos = new Set();
-                this.cacheManager.getAllGroups().forEach(g => {
-                    g.repos.forEach(r => groupedRepos.add(r));
-                });
-                
-                const ungroupedRepos = this.repoDataList
-                    .map((r, i) => ({ ...r, index: i }))
-                    .filter(r => !groupedRepos.has(r.path));
+                const data = await this.repoManager.analyzeRepo(repoId);
+                if (!data) {
+                    res.writeHead(500, { 'Content-Type': 'text/plain' });
+                    res.end('Failed to analyze repository');
+                    return;
+                }
                 
                 const options = {
-                    repoList: this.repoDataList.map((r, i) => ({ name: r.name, path: r.path, index: i })),
-                    currentIndex: repoIndex,
-                    groups: this.cacheManager.getAllGroups(),
-                    currentGroup: this.currentGroup,
-                    comparisonTargets,
-                    ungroupedRepos
+                    repoList: [{ name: repo.name, path: repo.path, index: 0 }],
+                    currentIndex: 0,
+                    groups: this.groupManager.getUserGroups(user.id),
+                    currentGroup: null,
+                    comparisonTargets: [],
+                    ungroupedRepos: []
                 };
-                const html = HTMLGenerator.generateHTML(repoEntry.data, options);
-                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                res.end(html);
-            }
-            // Serve comparison view
-            else if (parsedUrl.pathname === '/compare') {
-                if (!this.analysisComplete) {
-                    res.writeHead(302, { 'Location': '/' });
-                    res.end();
-                    return;
-                }
-
-                const packComparison = this.repoDataList.some(r => r.data && r.data.packAnalysis);
-                const html = HTMLGenerator.generateComparisonHTML(this.repoDataList, packComparison);
-                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-                res.end(html);
-            }
-            // Serve group view
-            else if (parsedUrl.pathname.startsWith('/group/')) {
-                const groupName = decodeURIComponent(parsedUrl.pathname.replace('/group/', ''));
-                const groupData = this.cacheManager.loadGroup(groupName);
                 
-                if (!groupData) {
+                this.sendHTML(res, HTMLGenerator.generateHTML(data, options));
+                return;
+            }
+            
+            // Group API
+            if (pathname === '/api/groups' && method === 'GET') {
+                const groups = this.groupManager.getUserGroups(user.id);
+                this.sendJSON(res, 200, { success: true, groups });
+                return;
+            }
+            
+            if (pathname === '/api/groups' && method === 'POST') {
+                let body = '';
+                req.on('data', chunk => { body += chunk; });
+                req.on('end', () => {
+                    try {
+                        const data = JSON.parse(body);
+                        const result = this.groupManager.createGroup(token, data.name, data.description, data.repoIds);
+                        this.sendJSON(res, result.success ? 200 : 400, result);
+                    } catch (error) {
+                        this.sendJSON(res, 400, { success: false, error: error.message });
+                    }
+                });
+                return;
+            }
+            
+            if (pathname.startsWith('/api/groups/') && method === 'DELETE') {
+                const groupId = pathname.replace('/api/groups/', '');
+                const result = this.groupManager.deleteGroup(token, groupId);
+                this.sendJSON(res, result.success ? 200 : 400, result);
+                return;
+            }
+            
+            // View group
+            if (pathname.startsWith('/group/') && method === 'GET') {
+                const groupId = pathname.replace('/group/', '');
+                const group = this.groupManager.getGroupById(groupId);
+                
+                if (!group) {
                     res.writeHead(404, { 'Content-Type': 'text/plain' });
                     res.end('Group not found');
                     return;
                 }
-
-                // Redirect to main page with group loading
-                this.repoPaths = groupData.repos;
-                this.currentGroup = groupName;
-                this.analysisComplete = false;
-                this.isAnalyzing = false;
-                this.analysisMap.clear();
-                this.repoDataList = [];
                 
-                res.writeHead(302, { 'Location': '/' });
-                res.end();
-                
-                // Start analysis for the group
-                this.startAnalysis().catch(err => {
-                    console.error('Group analysis failed:', err);
-                });
-            }
-            // API: Get groups
-            else if (parsedUrl.pathname === '/api/groups' && req.method === 'GET') {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify(this.cacheManager.getAllGroups(), null, 2));
-            }
-            // API: Create group (move selected repos)
-            else if (parsedUrl.pathname === '/api/groups' && req.method === 'POST') {
-                let body = '';
-                req.on('data', chunk => { body += chunk; });
-                req.on('end', () => {
-                    try {
-                        const data = JSON.parse(body);
-                        if (!data.name) {
-                            res.writeHead(400, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({ success: false, error: 'Group name required' }));
-                            return;
+                const repoDataList = [];
+                for (const repoId of group.repoIds) {
+                    const repo = this.repoManager.getRepoById(repoId);
+                    if (repo) {
+                        const data = await this.repoManager.analyzeRepo(repoId);
+                        if (data) {
+                            repoDataList.push({ path: repo.path, name: repo.name, data });
                         }
-                        
-                        const repos = data.repos || [];
-                        if (repos.length === 0) {
-                            res.writeHead(400, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({ success: false, error: 'At least one repository required' }));
-                            return;
-                        }
-                        
-                        // Move each repo to the new group
-                        repos.forEach(repoPath => {
-                            this.cacheManager.moveRepoToGroup(data.name, repoPath);
-                        });
-                        
-                        // Set description if provided
-                        if (data.description) {
-                            const groupData = this.cacheManager.loadGroup(data.name);
-                            if (groupData) {
-                                this.cacheManager.saveGroup(data.name, groupData.repos, data.description);
-                            }
-                        }
-                        
-                        res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ success: true, group: this.cacheManager.loadGroup(data.name) }));
-                    } catch (error) {
-                        res.writeHead(400, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ success: false, error: error.message }));
                     }
-                });
-            }
-            // API: Remove repo from group (returns to ungrouped)
-            else if (parsedUrl.pathname.startsWith('/api/groups/') && parsedUrl.pathname.endsWith('/remove-repo') && req.method === 'POST') {
-                const groupName = decodeURIComponent(parsedUrl.pathname.split('/')[3]);
-                let body = '';
-                req.on('data', chunk => { body += chunk; });
-                req.on('end', () => {
-                    try {
-                        const data = JSON.parse(body);
-                        const repoPath = data.repoPath;
-                        
-                        if (!repoPath) {
-                            res.writeHead(400, { 'Content-Type': 'application/json' });
-                            res.end(JSON.stringify({ success: false, error: 'Repository path required' }));
-                            return;
-                        }
-                        
-                        const success = this.cacheManager.removeRepoFromGroup(groupName, repoPath);
-                        
-                        res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ success, error: success ? null : 'Failed to remove repo from group' }));
-                    } catch (error) {
-                        res.writeHead(400, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ success: false, error: error.message }));
-                    }
-                });
-            }
-            // API: Delete group
-            else if (parsedUrl.pathname.startsWith('/api/groups/') && req.method === 'DELETE') {
-                const groupName = decodeURIComponent(parsedUrl.pathname.replace('/api/groups/', ''));
-                const success = this.cacheManager.deleteGroup(groupName);
-                
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ success, error: success ? null : 'Group not found' }));
-            }
-            // Progress API endpoint
-            else if (parsedUrl.pathname === '/api/progress') {
-                res.writeHead(200, { 
-                    'Content-Type': 'application/json',
-                    'Cache-Control': 'no-cache'
-                });
-                res.end(JSON.stringify(this.progress));
-            }
-            // Repos list API
-            else if (parsedUrl.pathname === '/api/repos') {
-                if (!this.analysisComplete) {
-                    res.writeHead(503, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: 'Analysis in progress' }));
-                } else {
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify(this.repoDataList.map((r, i) => ({
-                        name: r.name,
-                        path: r.path,
-                        index: i,
-                        hasData: !!r.data
-                    }))));
                 }
-            }
-            // Data API endpoint
-            else if (parsedUrl.pathname === '/api/data') {
-                if (!this.analysisComplete) {
-                    res.writeHead(503, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ error: 'Analysis in progress' }));
+                
+                if (repoDataList.length === 0) {
+                    res.writeHead(404, { 'Content-Type': 'text/plain' });
+                    res.end('No valid repositories in group');
                     return;
                 }
-
-                if (this.repoPaths.length === 1) {
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify(this.repoDataList[0].data, null, 2));
-                } else {
-                    const repoParam = parsedUrl.query.repo;
-                    if (repoParam === undefined) {
-                        res.writeHead(400, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ error: 'Missing repo parameter' }));
-                        return;
-                    }
-                    const repoIndex = parseInt(repoParam, 10);
-                    if (isNaN(repoIndex) || repoIndex < 0 || repoIndex >= this.repoDataList.length) {
-                        res.writeHead(404, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ error: 'Repository not found' }));
-                        return;
-                    }
-                    const repoEntry = this.repoDataList[repoIndex];
-                    if (!repoEntry.data) {
-                        res.writeHead(404, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ error: 'Repository data missing' }));
-                        return;
-                    }
-                    res.writeHead(200, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify(repoEntry.data, null, 2));
+                
+                const aggregatedData = await GroupAnalyzer.analyzeGroupWithPack(repoDataList);
+                if (!aggregatedData) {
+                    res.writeHead(500, { 'Content-Type': 'text/plain' });
+                    res.end('Failed to aggregate group data');
+                    return;
                 }
+                
+                const options = {
+                    repoList: repoDataList.map((r, i) => ({ name: r.name, path: r.path, index: i })),
+                    currentIndex: 0,
+                    groups: this.groupManager.getUserGroups(user.id),
+                    currentGroup: group.name,
+                    comparisonTargets: [],
+                    ungroupedRepos: []
+                };
+                
+                this.sendHTML(res, HTMLGenerator.generateHTML(aggregatedData, options));
+                return;
             }
-            else {
-                res.writeHead(404, { 'Content-Type': 'text/plain' });
-                res.end('Not Found');
+            
+            // Admin management routes (still require auth)
+            if (pathname === '/api/admin/logs' && method === 'GET') {
+                const logsData = this.dbManager.loadLogs();
+                this.sendJSON(res, 200, { success: true, logs: logsData.logs.slice(0, 50) });
+                return;
             }
+            
+            if (pathname === '/api/admin/logs/clear' && method === 'POST') {
+                this.dbManager.clearLogs();
+                this.sendJSON(res, 200, { success: true });
+                return;
+            }
+            
+            if (pathname === '/api/admin/logging/toggle' && method === 'POST') {
+                const status = this.dbManager.toggleLogging();
+                this.sendJSON(res, 200, { success: true, loggingEnabled: status });
+                return;
+            }
+            
+            // Default route
+            res.writeHead(302, { 'Location': '/dashboard' });
+            res.end();
         });
-
+        
         this.server.listen(this.port, () => {
             console.log(`\n🚀 GitView server is running at: http://localhost:${this.port}`);
-            if (this.currentGroup) {
-                console.log(`📦 Group: ${this.currentGroup}`);
-            }
-            if (this.repoPaths.length === 1) {
-                console.log(`📁 Repository: ${this.repoPaths[0]}`);
-            } else {
-                console.log(`📁 Repositories (${this.repoPaths.length}):`);
-                this.repoPaths.forEach(p => console.log(`   - ${p}`));
-            }
-            if (this.groups.length > 0) {
-                console.log(`\n📦 Available Groups:`);
-                this.groups.forEach(g => console.log(`   - ${g.name} (${g.repos.length} repos)`));
-            }
-            console.log(`\n📊 Loading page: http://localhost:${this.port}/`);
-            console.log(`🔍 View: http://localhost:${this.port}/view`);
-            console.log(`🔍 Comparison: http://localhost:${this.port}/compare`);
-            console.log(`📡 API: http://localhost:${this.port}/api/data`);
-            console.log(`📦 Groups API: http://localhost:${this.port}/api/groups`);
+            console.log(`📝 Register: http://localhost:${this.port}/register`);
+            console.log(`🔐 Login: http://localhost:${this.port}/login`);
+            console.log(`📊 Dashboard: http://localhost:${this.port}/dashboard`);
+            console.log(`\n📦 Database: ${this.dbManager.dbFile}`);
+            console.log(`📋 Logs: ${this.dbManager.logsFile}`);
+            console.log(`🔍 Logging: ${this.dbManager.getLoggingStatus() ? 'ENABLED' : 'DISABLED'}`);
             console.log(`\nPress Ctrl+C to stop the server\n`);
         });
-
+        
         return this.server;
     }
-
-    async startAnalysis() {
-        if (this.isAnalyzing) return;
-        this.isAnalyzing = true;
-        this.analysisComplete = false;
-        this.analysisMap.clear();
-        this.repoDataList = [];
-
-        const total = this.repoPaths.length;
-        let completed = 0;
-
-        for (let i = 0; i < total; i++) {
-            const repoPath = this.repoPaths[i];
-            const repoName = path.basename(repoPath);
-
-            // Check cache
-            let cached = this.cacheManager.load(repoPath);
-            
-            // Check if the repo has changed since caching
-            if (cached) {
-                try {
-                    const gitView = new GitView(repoPath);
-                    const currentCommit = gitView.executeGitOptional(['rev-parse', 'HEAD']);
-                    const cachedCommit = cached.repository?.currentCommit || null;
-                    
-                    if (!cachedCommit || currentCommit !== cachedCommit) {
-                        console.log(`📝 Changes detected in ${repoName}, re-analyzing...`);
-                        cached = null;
-                    }
-                } catch (error) {
-                    console.log(`⚠️ Failed to check git status for ${repoName}, re-analyzing...`);
-                    cached = null;
-                }
-            }
-            
-            if (cached) {
-                this.analysisMap.set(repoPath, cached);
-                completed++;
-                this.progress = {
-                    stage: 'cached',
-                    percent: Math.round((completed / total) * 100),
-                    message: `Loaded from cache: ${repoName}`,
-                    repoIndex: i,
-                    totalRepos: total,
-                    repoName,
-                    redirectUrl: this.repoPaths.length > 1 ? '/view?repo=0' : '/view'
-                };
-                continue;
-            }
-
-            // Analyze git data
-            try {
-                const gitData = await new Promise((resolve, reject) => {
-                    let settled = false;
-                    const worker = spawn('node', [this.workerPath, repoPath], {
-                        stdio: ['ignore', 'pipe', 'pipe', 'ipc']
-                    });
-
-                    worker.on('message', (msg) => {
-                        if (settled) return;
-                        if (msg.type === 'progress') {
-                            const overall = Math.round((i / total) * 100 + (msg.percent / total) * 0.7);
-                            this.progress = {
-                                stage: msg.stage,
-                                percent: overall,
-                                message: `[${repoName}] ${msg.message}`,
-                                repoIndex: i,
-                                totalRepos: total,
-                                repoName,
-                                redirectUrl: this.repoPaths.length > 1 ? '/view?repo=0' : '/view'
-                            };
-                        } else if (msg.type === 'complete') {
-                            settled = true;
-                            resolve(msg.data);
-                        } else if (msg.type === 'error') {
-                            settled = true;
-                            reject(new Error(msg.error));
-                        }
-                    });
-
-                    worker.on('error', (err) => {
-                        if (!settled) {
-                            settled = true;
-                            reject(err);
-                        }
-                    });
-
-                    worker.on('exit', (code) => {
-                        if (!settled) {
-                            settled = true;
-                            reject(new Error(`Worker exited with code ${code}`));
-                        }
-                    });
-                });
-
-                this.progress = {
-                    stage: 'pack',
-                    percent: Math.round((i / total) * 100 + 70 / total),
-                    message: `[${repoName}] Running Pack analysis...`,
-                    repoIndex: i,
-                    totalRepos: total,
-                    repoName,
-                    redirectUrl: this.repoPaths.length > 1 ? '/view?repo=0' : '/view'
-                };
-
-                // Run Pack analysis
-                let packAnalysis = null;
-                try {
-                    const packResult = await analyzeDirectories(repoPath);
-                    packAnalysis = packResult.report || packResult;
-                } catch (packError) {
-                    console.error(`Pack analysis failed for ${repoName}: ${packError.message}`);
-                    packAnalysis = null;
-                }
-
-                const fullData = {
-                    ...gitData,
-                    packAnalysis: packAnalysis,
-                    repository: {
-                        ...gitData.repository,
-                        currentCommit: gitData.repository.currentCommit || 
-                                      new GitView(repoPath).executeGitOptional(['rev-parse', 'HEAD'])
-                    }
-                };
-
-                this.analysisMap.set(repoPath, fullData);
-                this.cacheManager.save(repoPath, fullData);
-                completed++;
-                this.progress = {
-                    stage: 'complete',
-                    percent: Math.round((completed / total) * 100),
-                    message: `Analyzed: ${repoName}`,
-                    repoIndex: i,
-                    totalRepos: total,
-                    repoName,
-                    redirectUrl: this.repoPaths.length > 1 ? '/view?repo=0' : '/view'
-                };
-            } catch (error) {
-                console.error(`Error analyzing ${repoPath}: ${error.message}`);
-                this.analysisMap.set(repoPath, null);
-                completed++;
-                this.progress = {
-                    stage: 'error',
-                    percent: Math.round((completed / total) * 100),
-                    message: `Error analyzing ${repoName}: ${error.message}`,
-                    repoIndex: i,
-                    totalRepos: total,
-                    repoName,
-                    redirectUrl: this.repoPaths.length > 1 ? '/view?repo=0' : '/view'
-                };
-            }
-        }
-
-        // Build repoDataList
-        this.repoDataList = this.repoPaths.map(p => ({
-            path: p,
-            name: path.basename(p),
-            data: this.analysisMap.get(p) || null
-        }));
-
-        // If this is a group, aggregate the data
-        if (this.currentGroup && this.repoDataList.length > 1) {
-            const aggregatedData = await GroupAnalyzer.analyzeGroupWithPack(this.repoDataList);
-            if (aggregatedData) {
-                this.repoDataList.push({
-                    path: `GROUP:${this.currentGroup}`,
-                    name: `📦 ${this.currentGroup} (Group)`,
-                    data: aggregatedData,
-                    isGroup: true
-                });
-            }
-        }
-
-        if (this.repoPaths.length === 1 && this.repoDataList.length === 1) {
-            this.analysisData = this.repoDataList[0].data;
-        }
-
-        this.analysisComplete = true;
-        this.isAnalyzing = false;
-        this.progress.percent = 100;
-        this.progress.stage = 'complete';
-        this.progress.message = 'Analysis complete';
-    }
-
+    
     stop() {
         if (this.server) {
             this.server.close();
@@ -3242,7 +4806,7 @@ try {
 }
 
 // ============================================================================
-// UTILITY: FIND GIT REPOSITORIES IN DIRECTORY
+// UTILITY: FIND GIT REPOSITORIES IN DIRECTORY (Preserved from original)
 // ============================================================================
 
 function findGitRepos(rootDir) {
@@ -3274,13 +4838,13 @@ function findGitRepos(rootDir) {
 }
 
 // ============================================================================
-// MAIN APPLICATION
+// MAIN APPLICATION (Enhanced with management commands)
 // ============================================================================
 
 class GitViewApp {
     constructor() {
         this.parser = new ArgumentParser();
-        this.cacheManager = new CacheManager();
+        this.dbManager = new DatabaseManager();
         this.run();
     }
 
@@ -3291,142 +4855,116 @@ class GitViewApp {
         }
 
         try {
-            let repoInput;
-            
-            // Handle group operations
-            if (this.parser.args.createGroup) {
-                const groupName = this.parser.args.createGroup;
-                const repos = this.parser.args.dir 
-                    ? findGitRepos(this.parser.args.repoPath) 
-                    : [this.parser.args.repoPath];
-                
-                // Move repos to new group
-                repos.forEach(repo => {
-                    this.cacheManager.moveRepoToGroup(groupName, repo);
-                });
-                
-                console.log(`✅ Group "${groupName}" created with ${repos.length} repositories (moved from ungrouped)`);
+            // Handle management commands
+            if (this.parser.args.clearDB) {
+                this.dbManager.clearAll();
+                console.log('✅ Database cleared successfully');
                 return;
             }
             
-            if (this.parser.args.addToGroup) {
-                const groupName = this.parser.args.addToGroup;
-                const repos = this.parser.args.dir 
-                    ? findGitRepos(this.parser.args.repoPath) 
-                    : [this.parser.args.repoPath];
-                
-                // Move repos to existing group
-                repos.forEach(repo => {
-                    this.cacheManager.moveRepoToGroup(groupName, repo);
-                });
-                
-                const groupData = this.cacheManager.loadGroup(groupName);
-                console.log(`✅ Moved ${repos.length} repositories to group "${groupName}" (${groupData.repos.length} total)`);
+            if (this.parser.args.clearLogs) {
+                this.dbManager.clearLogs();
+                console.log('✅ Logs cleared successfully');
                 return;
             }
             
-            // Load group if specified
-            if (this.parser.args.group) {
-                const groupData = this.cacheManager.loadGroup(this.parser.args.group);
-                if (!groupData) {
-                    console.error(`❌ Group "${this.parser.args.group}" not found`);
-                    process.exit(1);
-                }
-                console.log(`📦 Loading group "${this.parser.args.group}" with ${groupData.repos.length} repositories`);
-                repoInput = {
-                    group: this.parser.args.group,
-                    repos: groupData.repos
-                };
-            } else if (this.parser.args.dir) {
-                const allRepos = findGitRepos(this.parser.args.repoPath);
-                if (allRepos.length === 0) {
-                    console.error(`❌ No .git repositories found in ${this.parser.args.repoPath}`);
-                    process.exit(1);
-                }
-                
-                // Get repos that are not in any group (ungrouped)
-                const groupedRepos = new Set();
-                this.cacheManager.getAllGroups().forEach(g => {
-                    g.repos.forEach(r => groupedRepos.add(r));
-                });
-                
-                const ungroupedRepos = allRepos.filter(repo => !groupedRepos.has(repo));
-                
-                console.log(`📁 Found ${allRepos.length} repositories in ${this.parser.args.repoPath}`);
-                console.log(`📦 ${ungroupedRepos.length} ungrouped repositories will be shown`);
-                
-                repoInput = ungroupedRepos;
-            } else {
-                repoInput = this.parser.args.repoPath;
+            if (this.parser.args.toggleLogging) {
+                const status = this.dbManager.toggleLogging();
+                console.log(`✅ Logging ${status ? 'ENABLED' : 'DISABLED'}`);
+                return;
             }
-
-            // Generate static HTML if requested
-            if (this.parser.args.html) {
-                const reposToAnalyze = Array.isArray(repoInput) ? repoInput : 
-                                     (repoInput.repos || [repoInput]);
-                
-                const outputDir = process.cwd();
-                const repoDataList = [];
-                
-                for (const repoPath of reposToAnalyze) {
-                    const repoName = path.basename(repoPath);
-                    console.log(`📊 Analyzing ${repoName}...`);
-                    
-                    let data = this.cacheManager.load(repoPath);
-                    if (!data) {
-                        const gitView = new GitView(repoPath);
-                        const gitData = gitView.getAllData();
-                        gitData.repository.currentCommit = gitView.executeGitOptional(['rev-parse', 'HEAD']);
-                        
-                        let packAnalysis = null;
-                        try {
-                            const packResult = await analyzeDirectories(repoPath);
-                            packAnalysis = packResult.report || packResult;
-                        } catch (packError) {
-                            console.error(`Pack analysis failed for ${repoName}: ${packError.message}`);
+            
+            if (this.parser.args.showLogs) {
+                const logsData = this.dbManager.loadLogs();
+                console.log('\n📋 Recent Logs:');
+                if (logsData.logs.length === 0) {
+                    console.log('  No logs found');
+                } else {
+                    logsData.logs.slice(0, 20).forEach(log => {
+                        console.log(`  [${log.timestamp}] [${log.level.toUpperCase()}] ${log.message}`);
+                        if (Object.keys(log.metadata).length > 0) {
+                            console.log(`    Metadata: ${JSON.stringify(log.metadata)}`);
                         }
-                        
-                        data = {
-                            ...gitData,
-                            packAnalysis: packAnalysis
-                        };
-                        this.cacheManager.save(repoPath, data);
-                    }
-                    
-                    repoDataList.push({
-                        path: repoPath,
-                        name: repoName,
-                        data: data
                     });
-                    
-                    const html = HTMLGenerator.generateHTML(data, {
-                        repoList: repoDataList.map((r, i) => ({ name: r.name, path: r.path, index: i })),
-                        currentIndex: repoDataList.length - 1,
-                        groups: this.cacheManager.getAllGroups(),
-                        ungroupedRepos: repoDataList.map((r, i) => ({ ...r, index: i }))
+                }
+                return;
+            }
+            
+            if (this.parser.args.listUsers) {
+                const db = this.dbManager.loadDB();
+                console.log('\n👥 Registered Users:');
+                if (db.users.length === 0) {
+                    console.log('  No users registered');
+                } else {
+                    db.users.forEach(user => {
+                        console.log(`  - ${user.name} (${user.email}) - ID: ${user.id}`);
+                        console.log(`    Created: ${user.createdAt}`);
                     });
-                    
-                    const safeName = repoName.replace(/[^a-zA-Z0-9-_]/g, '_');
-                    const outputPath = path.join(outputDir, `gitview-${safeName}.html`);
-                    fs.writeFileSync(outputPath, html, 'utf8');
-                    console.log(`✅ Generated: ${outputPath}`);
+                }
+                return;
+            }
+            
+            if (this.parser.args.listRepos) {
+                const db = this.dbManager.loadDB();
+                console.log('\n📁 Registered Repositories:');
+                if (db.repos.length === 0) {
+                    console.log('  No repositories registered');
+                } else {
+                    db.repos.forEach(repo => {
+                        const owner = db.users.find(u => u.id === repo.ownerId);
+                        console.log(`  - ${repo.name} (${repo.path})`);
+                        console.log(`    Owner: ${owner ? owner.name : 'Unknown'} (${owner ? owner.email : 'N/A'})`);
+                        console.log(`    Public: ${repo.isPublic}`);
+                    });
+                }
+                return;
+            }
+            
+            // Start server
+            if (this.parser.args.server) {
+                const server = new GitViewServer(this.parser.args.port);
+                server.start();
+                return;
+            }
+            
+            // Generate static HTML
+            if (this.parser.args.html) {
+                const repoPath = this.parser.args.repoPath;
+                console.log(`📊 Analyzing ${path.basename(repoPath)}...`);
+                
+                const gitView = new GitView(repoPath);
+                const gitData = gitView.getAllData();
+                
+                let packAnalysis = null;
+                try {
+                    const packResult = await analyzeDirectories(repoPath);
+                    packAnalysis = packResult.report || packResult;
+                } catch (error) {
+                    console.error(`Pack analysis failed: ${error.message}`);
                 }
                 
-                // Generate comparison HTML if multiple repos
-                if (repoDataList.length > 1) {
-                    const comparisonHTML = HTMLGenerator.generateComparisonHTML(repoDataList, true);
-                    const comparisonPath = path.join(outputDir, 'gitview-comparison.html');
-                    fs.writeFileSync(comparisonPath, comparisonHTML, 'utf8');
-                    console.log(`✅ Generated comparison: ${comparisonPath}`);
-                }
+                const fullData = {
+                    ...gitData,
+                    packAnalysis,
+                    repository: {
+                        ...gitData.repository,
+                        currentCommit: gitView.executeGitOptional(['rev-parse', 'HEAD'])
+                    }
+                };
+                
+                const html = HTMLGenerator.generateHTML(fullData, {
+                    repoList: [{ name: path.basename(repoPath), path: repoPath, index: 0 }],
+                    currentIndex: 0,
+                    groups: [],
+                    ungroupedRepos: []
+                });
+                
+                const outputPath = path.join(process.cwd(), 'gitview.html');
+                fs.writeFileSync(outputPath, html, 'utf8');
+                console.log(`✅ Generated: ${outputPath}`);
+                return;
             }
-
-            // Start server if requested
-            if (this.parser.args.server) {
-                const server = new GitViewServer(repoInput, this.parser.args.port, this.cacheManager);
-                server.start();
-            }
-
+            
         } catch (error) {
             console.error('❌ Error:', error.message);
             console.log('\nTip: Run with --help for usage information');
@@ -3446,6 +4984,10 @@ export {
     LoadingPageGenerator, 
     ArgumentParser, 
     CacheManager, 
+    DatabaseManager,
+    AuthManager,
+    RepositoryManager,
+    GroupManager,
     findGitRepos,
     GroupAnalyzer,
     analyzeDirectories
