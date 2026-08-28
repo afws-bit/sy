@@ -1693,20 +1693,210 @@ class GroupAnalyzer {
     static async analyzeGroupWithPack(repoDataList) {
         const aggregatedData = this.analyzeGroup(repoDataList);
         if (!aggregatedData) return null;
-
+    
         const validRepos = repoDataList.filter(r => r && r.data);
         const packInputs = validRepos.map(r => r.path);
         
         if (packInputs.length > 0) {
             try {
-                const packResult = await analyzeDirectories(packInputs);
-                aggregatedData.packAnalysis = packResult.report || packResult;
+                // Aggregate Pack.js data from individual repos instead of analyzing all at once
+                const aggregatedPackData = {
+                    'Total Size Analyzer': {
+                        realTotalSizeFormatted: '0 B',
+                        realTotalSizeMB: 0,
+                        totalSizeFormatted: '0 B',
+                        codeSizeFormatted: '0 B',
+                        codeSizeMB: 0,
+                        binarySizeFormatted: '0 B',
+                        archiveSizeFormatted: '0 B',
+                        gitSizeFormatted: '0 B',
+                        codePurityRate: '0%',
+                        repositoryEfficiencyRate: '0%',
+                        fileCount: 0,
+                        dirCount: 0
+                    },
+                    'Lines of Code Analyzer': {
+                        totalLinesFormatted: '0',
+                        totalLines: 0,
+                        languages: []
+                    },
+                    'Archive Files Analyzer': {
+                        totalCount: 0
+                    },
+                    'Binary Files Analyzer': {
+                        totalCount: 0
+                    },
+                    'Package.json Analyzer': {
+                        totalCount: 0
+                    },
+                    'Git Analyzer': {
+                        totalUniqueContributors: 0,
+                        totalRepositories: 0,
+                        totalCommits: 0,
+                        totalPureCodeAddedFormatted: '0 B',
+                        averagePureCodeAddedPerCommitFormatted: '0 B'
+                    }
+                };
+                
+                // Aggregate data from individual repo pack analyses
+                const languageMap = new Map();
+                let totalRealSizeMB = 0;
+                let totalCodeSizeMB = 0;
+                let totalBinarySizeMB = 0;
+                let totalArchiveSizeMB = 0;
+                let totalGitSizeMB = 0;
+                let totalLines = 0;
+                let totalCommits = 0;
+                let totalPureCodeAdded = 0;
+                let totalFiles = 0;
+                let totalDirs = 0;
+                let totalArchiveFiles = 0;
+                let totalBinaryFiles = 0;
+                let uniqueContributors = new Set();
+                
+                for (const repo of validRepos) {
+                    const packData = repo.data.packAnalysis;
+                    if (packData) {
+                        // Aggregate sizes
+                        if (packData['Total Size Analyzer']) {
+                            const sizeData = packData['Total Size Analyzer'];
+                            totalRealSizeMB += sizeData.realTotalSizeMB || 0;
+                            totalCodeSizeMB += sizeData.codeSizeMB || 0;
+                            totalFiles += sizeData.fileCount || 0;
+                            totalDirs += sizeData.dirCount || 0;
+                            
+                            // Parse binary size
+                            if (sizeData.binarySizeFormatted) {
+                                const binaryMB = parseFloat(sizeData.binarySizeFormatted) || 0;
+                                totalBinarySizeMB += binaryMB;
+                            }
+                            
+                            // Parse archive size
+                            if (sizeData.archiveSizeFormatted) {
+                                const archiveMB = parseFloat(sizeData.archiveSizeFormatted) || 0;
+                                totalArchiveSizeMB += archiveMB;
+                            }
+                            
+                            // Parse git size
+                            if (sizeData.gitSizeFormatted) {
+                                const gitMB = parseFloat(sizeData.gitSizeFormatted) || 0;
+                                totalGitSizeMB += gitMB;
+                            }
+                        }
+                        
+                        // Aggregate lines of code
+                        if (packData['Lines of Code Analyzer']) {
+                            const locData = packData['Lines of Code Analyzer'];
+                            totalLines += locData.totalLines || 0;
+                            
+                            // Aggregate languages
+                            if (locData.languages) {
+                                for (const lang of locData.languages) {
+                                    if (!languageMap.has(lang.language)) {
+                                        languageMap.set(lang.language, {
+                                            language: lang.language,
+                                            lines: 0,
+                                            files: 0,
+                                            percentage: 0
+                                        });
+                                    }
+                                    const langData = languageMap.get(lang.language);
+                                    langData.lines += lang.lines || 0;
+                                    langData.files += lang.files || 0;
+                                }
+                            }
+                        }
+                        
+                        // Aggregate archive files
+                        if (packData['Archive Files Analyzer']) {
+                            totalArchiveFiles += packData['Archive Files Analyzer'].totalCount || 0;
+                        }
+                        
+                        // Aggregate binary files
+                        if (packData['Binary Files Analyzer']) {
+                            totalBinaryFiles += packData['Binary Files Analyzer'].totalCount || 0;
+                        }
+                        
+                        // Aggregate git data
+                        if (packData['Git Analyzer']) {
+                            const gitData = packData['Git Analyzer'];
+                            totalCommits += gitData.totalCommits || 0;
+                            totalPureCodeAdded += gitData.totalPureCodeAdded || 0;
+                            
+                            // Collect unique contributors
+                            if (gitData.contributors) {
+                                gitData.contributors.forEach(c => uniqueContributors.add(c.email || c.name));
+                            } else if (gitData.totalUniqueContributors) {
+                                // If we have the count but not the list, use repo authors
+                                if (repo.data.authors) {
+                                    repo.data.authors.forEach(a => uniqueContributors.add(a.email));
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Calculate total sizes
+                const formatSize = (mb) => {
+                    if (mb < 1) return (mb * 1024).toFixed(1) + ' KB';
+                    if (mb < 1024) return mb.toFixed(1) + ' MB';
+                    return (mb / 1024).toFixed(2) + ' GB';
+                };
+                
+                // Update aggregated pack data
+                aggregatedPackData['Total Size Analyzer'] = {
+                    realTotalSizeMB: totalRealSizeMB,
+                    realTotalSizeFormatted: formatSize(totalRealSizeMB),
+                    totalSizeFormatted: formatSize(totalRealSizeMB + totalGitSizeMB),
+                    codeSizeMB: totalCodeSizeMB,
+                    codeSizeFormatted: formatSize(totalCodeSizeMB),
+                    binarySizeFormatted: formatSize(totalBinarySizeMB),
+                    archiveSizeFormatted: formatSize(totalArchiveSizeMB),
+                    gitSizeFormatted: formatSize(totalGitSizeMB),
+                    codePurityRate: totalRealSizeMB > 0 ? ((totalCodeSizeMB / totalRealSizeMB) * 100).toFixed(1) + '%' : '0%',
+                    repositoryEfficiencyRate: totalRealSizeMB > 0 ? (((totalCodeSizeMB + totalBinarySizeMB + totalArchiveSizeMB) / totalRealSizeMB) * 100).toFixed(1) + '%' : '0%',
+                    fileCount: totalFiles,
+                    dirCount: totalDirs
+                };
+                
+                // Calculate language percentages
+                const languages = Array.from(languageMap.values());
+                languages.forEach(lang => {
+                    lang.percentage = totalLines > 0 ? ((lang.lines / totalLines) * 100).toFixed(1) : 0;
+                });
+                languages.sort((a, b) => b.lines - a.lines);
+                
+                aggregatedPackData['Lines of Code Analyzer'] = {
+                    totalLines: totalLines,
+                    totalLinesFormatted: totalLines.toLocaleString(),
+                    languages: languages
+                };
+                
+                aggregatedPackData['Archive Files Analyzer'] = {
+                    totalCount: totalArchiveFiles
+                };
+                
+                aggregatedPackData['Binary Files Analyzer'] = {
+                    totalCount: totalBinaryFiles
+                };
+                
+                aggregatedPackData['Git Analyzer'] = {
+                    totalUniqueContributors: uniqueContributors.size,
+                    totalRepositories: validRepos.length,
+                    totalCommits: totalCommits,
+                    totalPureCodeAdded: totalPureCodeAdded,
+                    totalPureCodeAddedFormatted: formatSize(totalPureCodeAdded / (1024 * 1024)), // Convert bytes to MB
+                    averagePureCodeAddedPerCommit: totalCommits > 0 ? totalPureCodeAdded / totalCommits : 0,
+                    averagePureCodeAddedPerCommitFormatted: totalCommits > 0 ? formatSize((totalPureCodeAdded / totalCommits) / (1024 * 1024)) : '0 B'
+                };
+                
+                aggregatedData.packAnalysis = aggregatedPackData;
             } catch (error) {
                 console.error(`Pack analysis failed for group: ${error.message}`);
                 aggregatedData.packAnalysis = null;
             }
         }
-
+    
         return aggregatedData;
     }
 }
@@ -3611,12 +3801,12 @@ class HTMLGenerator {
 <body>
     <div class="container">
         <div class="nav-bar fade-in">
-            <a href="/dashboard" class="nav-link">🏠 Dashboard</a>
-            ${hasMultiple ? `<a href="/compare" class="nav-link">🔍 Comparison</a>` : ''}
-            <button class="nav-link" onclick="openGroupsModal()">📦 Groups</button>
-            <button class="nav-link" onclick="openNewGroupModal()">➕ New Group</button>
-            ${comparisonTargets.length > 0 ? `<button class="nav-link" onclick="openCompareModal()">⚖️ Compare With</button>` : ''}
-        </div>
+    <a href="/dashboard" class="nav-link">🏠 Dashboard</a>
+    <a href="/compare?repos=${repoList.map(r => r.id || '').filter(Boolean).join(',')}" class="nav-link">🔍 Compare All</a>
+    <button class="nav-link" onclick="openGroupsModal()">📦 Groups</button>
+    <button class="nav-link" onclick="openNewGroupModal()">➕ New Group</button>
+    ${comparisonTargets.length > 0 ? `<button class="nav-link" onclick="openCompareModal()">⚖️ Compare With</button>` : ''}
+</div>
 
         ${hasMultiple ? `
         <div class="repo-selector fade-in">
@@ -3656,6 +3846,41 @@ class HTMLGenerator {
                 </div>
             </div>
         </div>
+
+
+        ${data.groupRepos && data.groupRepos.length > 0 ? `
+            <div class="pack-info fade-in">
+                <h2>📁 Repositories in this Group (${data.groupRepos.length})</h2>
+                <div style="overflow-x: auto;">
+                    <table style="width: 100%; border-collapse: collapse;">
+                        <thead>
+                            <tr>
+                                <th style="padding: 8px; text-align: left; border-bottom: 1px solid var(--border); color: var(--accent);">Repository</th>
+                                <th style="padding: 8px; text-align: left; border-bottom: 1px solid var(--border); color: var(--accent);">Path</th>
+                                <th style="padding: 8px; text-align: right; border-bottom: 1px solid var(--border); color: var(--accent);">Commits</th>
+                                <th style="padding: 8px; text-align: right; border-bottom: 1px solid var(--border); color: var(--accent);">Contributors</th>
+                                <th style="padding: 8px; text-align: right; border-bottom: 1px solid var(--border); color: var(--accent);">Branches</th>
+                                <th style="padding: 8px; text-align: right; border-bottom: 1px solid var(--border); color: var(--accent);">Size</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${data.groupRepos.map(repo => `
+                            <tr>
+                                <td style="padding: 8px; border-bottom: 1px solid var(--border);">
+                                    <a href="/repo/${repo.id}" style="color: var(--accent); text-decoration: none;">${repo.name}</a>
+                                </td>
+                                <td style="padding: 8px; border-bottom: 1px solid var(--border); color: var(--text-secondary); font-size: 12px;">${repo.path}</td>
+                                <td style="padding: 8px; border-bottom: 1px solid var(--border); text-align: right;">${repo.commits}</td>
+                                <td style="padding: 8px; border-bottom: 1px solid var(--border); text-align: right;">${repo.contributors}</td>
+                                <td style="padding: 8px; border-bottom: 1px solid var(--border); text-align: right;">${repo.branches}</td>
+                                <td style="padding: 8px; border-bottom: 1px solid var(--border); text-align: right;">${repo.size}</td>
+                            </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            ` : ''}
 
         <div class="stats-grid fade-in">
             <div class="stat-card">
@@ -3868,15 +4093,15 @@ class HTMLGenerator {
                 <span class="close" onclick="closeGroupsModal()">&times;</span>
             </div>
             <div id="groupsList">
-                ${groups.map(group => `
-                    <div class="info-card" style="margin-bottom: 10px;">
-                        <h3>${group.name}</h3>
-                        <p>${group.description || 'No description'}</p>
-                        <p>Repositories: ${group.repos.length}</p>
-                        <button class="btn btn-primary" onclick="loadGroup('${group.name}')">Load</button>
-                        <button class="btn btn-danger" onclick="deleteGroup('${group.name}')">Delete</button>
-                    </div>
-                `).join('')}
+            ${groups.map(group => `
+                <div class="info-card" style="margin-bottom: 10px;">
+                    <h3>${group.name}</h3>
+                    <p>${group.description || 'No description'}</p>
+                    <p>Repositories: ${group.repoIds ? group.repoIds.length : 0}</p>
+                    <button class="btn btn-primary" onclick="loadGroup('${group.id}')">Load</button>
+                    <button class="btn btn-danger" onclick="deleteGroup('${group.id}')">Delete</button>
+                </div>
+            `).join('')}
                 ${groups.length === 0 ? '<p style="text-align: center; color: var(--text-secondary);">No groups yet. Create one!</p>' : ''}
             </div>
         </div>
@@ -4005,26 +4230,26 @@ class HTMLGenerator {
             document.getElementById('compareModal').style.display = 'none';
         }
 
-        function loadGroup(groupName) {
-            window.location.href = '/group/' + encodeURIComponent(groupName);
-        }
+        function loadGroup(groupId) {
+    window.location.href = '/group/' + encodeURIComponent(groupId);
+}
 
-        function deleteGroup(groupName) {
-            if (confirm('Are you sure you want to delete group "' + groupName + '"?')) {
-                fetch('/api/groups/' + encodeURIComponent(groupName), { method: 'DELETE' })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            location.reload();
-                        } else {
-                            alert('Failed to delete group: ' + data.error);
-                        }
-                    })
-                    .catch(error => {
-                        alert('Error deleting group: ' + error.message);
-                    });
-            }
-        }
+function deleteGroup(groupId) {
+    if (confirm('Are you sure you want to delete this group?')) {
+        fetch('/api/groups/' + encodeURIComponent(groupId), { method: 'DELETE' })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Failed to delete group: ' + data.error);
+                }
+            })
+            .catch(error => {
+                alert('Error deleting group: ' + error.message);
+            });
+    }
+}
 
         function createGroup() {
             const name = document.getElementById('groupName').value.trim();
@@ -4706,60 +4931,149 @@ try {
             }
             
             if (pathname.startsWith('/api/groups/') && method === 'DELETE') {
-                const groupId = pathname.replace('/api/groups/', '');
+                const groupId = decodeURIComponent(pathname.replace('/api/groups/', ''));
                 const result = this.groupManager.deleteGroup(token, groupId);
                 this.sendJSON(res, result.success ? 200 : 400, result);
                 return;
             }
             
             // View group
-            if (pathname.startsWith('/group/') && method === 'GET') {
-                const groupId = pathname.replace('/group/', '');
-                const group = this.groupManager.getGroupById(groupId);
-                
-                if (!group) {
-                    res.writeHead(404, { 'Content-Type': 'text/plain' });
-                    res.end('Group not found');
-                    return;
-                }
-                
-                const repoDataList = [];
-                for (const repoId of group.repoIds) {
-                    const repo = this.repoManager.getRepoById(repoId);
-                    if (repo) {
-                        const data = await this.repoManager.analyzeRepo(repoId);
-                        if (data) {
-                            repoDataList.push({ path: repo.path, name: repo.name, data });
-                        }
+if (pathname.startsWith('/group/') && method === 'GET') {
+    const groupId = decodeURIComponent(pathname.replace('/group/', ''));
+    const group = this.groupManager.getGroupById(groupId);
+    
+    if (!group) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Group not found');
+        return;
+    }
+    
+    const repoDataList = [];
+    const repoInfoList = [];
+    for (const repoId of group.repoIds) {
+        const repo = this.repoManager.getRepoById(repoId);
+        if (repo) {
+            const data = await this.repoManager.analyzeRepo(repoId);
+            if (data) {
+                repoDataList.push({ path: repo.path, name: repo.name, data });
+                repoInfoList.push({ 
+                    id: repo.id,
+                    name: repo.name, 
+                    path: repo.path, 
+                    description: repo.description || '',
+                    commits: data.health.totalCommits,
+                    contributors: data.authors.length,
+                    branches: data.branches.length,
+                    size: data.health.repoSize
+                });
+            }
+        }
+    }
+    
+    if (repoDataList.length === 0) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('No valid repositories in group');
+        return;
+    }
+    
+    const aggregatedData = await GroupAnalyzer.analyzeGroupWithPack(repoDataList);
+    if (!aggregatedData) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('Failed to aggregate group data');
+        return;
+    }
+    
+    // Add repo info to aggregated data for display
+    aggregatedData.groupRepos = repoInfoList;
+    
+    const options = {
+        repoList: repoDataList.map((r, i) => ({ 
+            name: r.name, 
+            path: r.path, 
+            index: i,
+            id: group.repoIds[i] || i
+        })),
+        currentIndex: 0,
+        groups: this.groupManager.getUserGroups(user.id),
+        currentGroup: group.name,
+        comparisonTargets: [
+            ...this.repoManager.getUserRepos(user.id).map(repo => ({
+                type: 'repo',
+                name: repo.name,
+                id: repo.id
+            })),
+            ...this.groupManager.getUserGroups(user.id)
+                .filter(g => g.id !== group.id)
+                .map(g => ({
+                    type: 'group',
+                    name: g.name,
+                    id: g.id
+                }))
+        ],
+        ungroupedRepos: []
+    };
+    
+    this.sendHTML(res, HTMLGenerator.generateHTML(aggregatedData, options));
+    return;
+}
+            
+// Compare view
+if (pathname === '/compare' && method === 'GET') {
+    const repos = this.repoManager.getUserRepos(user.id);
+    const groups = this.groupManager.getUserGroups(user.id);
+    
+    // Get selected repos/groups from query params
+    const selectedRepos = parsedUrl.query.repos ? parsedUrl.query.repos.split(',') : [];
+    const selectedGroups = parsedUrl.query.groups ? parsedUrl.query.groups.split(',') : [];
+    
+    const repoDataList = [];
+    
+    // Add selected repositories
+    for (const repoId of selectedRepos) {
+        const repo = this.repoManager.getRepoById(repoId);
+        if (repo) {
+            const data = await this.repoManager.analyzeRepo(repoId);
+            if (data) {
+                repoDataList.push({ path: repo.path, name: repo.name, data });
+            }
+        }
+    }
+    
+    // Add selected groups
+    for (const groupId of selectedGroups) {
+        const group = this.groupManager.getGroupById(groupId);
+        if (group) {
+            const groupRepoDataList = [];
+            for (const repoId of group.repoIds) {
+                const repo = this.repoManager.getRepoById(repoId);
+                if (repo) {
+                    const data = await this.repoManager.analyzeRepo(repoId);
+                    if (data) {
+                        groupRepoDataList.push({ path: repo.path, name: repo.name, data });
                     }
                 }
-                
-                if (repoDataList.length === 0) {
-                    res.writeHead(404, { 'Content-Type': 'text/plain' });
-                    res.end('No valid repositories in group');
-                    return;
-                }
-                
-                const aggregatedData = await GroupAnalyzer.analyzeGroupWithPack(repoDataList);
-                if (!aggregatedData) {
-                    res.writeHead(500, { 'Content-Type': 'text/plain' });
-                    res.end('Failed to aggregate group data');
-                    return;
-                }
-                
-                const options = {
-                    repoList: repoDataList.map((r, i) => ({ name: r.name, path: r.path, index: i })),
-                    currentIndex: 0,
-                    groups: this.groupManager.getUserGroups(user.id),
-                    currentGroup: group.name,
-                    comparisonTargets: [],
-                    ungroupedRepos: []
-                };
-                
-                this.sendHTML(res, HTMLGenerator.generateHTML(aggregatedData, options));
-                return;
             }
-            
+            if (groupRepoDataList.length > 0) {
+                const groupData = await GroupAnalyzer.analyzeGroupWithPack(groupRepoDataList);
+                if (groupData) {
+                    repoDataList.push({ path: 'GROUP', name: group.name, data: groupData });
+                }
+            }
+        }
+    }
+    
+    if (repoDataList.length < 2) {
+        // Redirect to dashboard if not enough items to compare
+        res.writeHead(302, { 'Location': '/dashboard' });
+        res.end();
+        return;
+    }
+    
+    const comparisonHTML = HTMLGenerator.generateComparisonHTML(repoDataList, true);
+    this.sendHTML(res, comparisonHTML);
+    return;
+}
+
             // Admin management routes (still require auth)
             if (pathname === '/api/admin/logs' && method === 'GET') {
                 const logsData = this.dbManager.loadLogs();
