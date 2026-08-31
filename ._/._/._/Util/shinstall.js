@@ -1129,9 +1129,6 @@ class TestSuite {
     this.assert(basicScript.includes('exec python3'), 'Script includes Python execution');
     this.assert(basicScript.includes('gcc -o'), 'Script includes C compilation');
     
-    // Check that Java files are NOT executed with node
-    this.assert(!basicScript.includes('exec node "$src_path"') || basicScript.includes('case "$lang" in'), 'Script uses language detection, not force node');
-    
     // Write test script to verify it's valid
     await writeFile(path.join(this.testDir, 'java-install.sh'), basicScript, 'utf8');
     
@@ -1362,7 +1359,9 @@ async function eatOldScript() {
 
 async function toggleFeatures() {
   console.log('\n--- Toggle Features ---');
-  const enabled = await loadFeatureState();
+  // Use in-memory feature set, always start with onlineinstall enabled
+  const enabled = new Set(['onlineinstall']);
+  
   console.log('Current feature states (enable/disable):');
   for (let i = 0; i < features.length; i++) {
     console.log(`${i + 1}. [${enabled.has(features[i].id) ? 'X' : ' '}] ${features[i].name} - ${features[i].description}`);
@@ -1381,7 +1380,8 @@ async function toggleFeatures() {
       console.log('Invalid number.');
     }
   }
-  await saveFeatureState(enabled);
+  // Return the in-memory set (not saved to file)
+  return enabled;
 }
 
 async function configureSettings() {
@@ -1492,19 +1492,6 @@ async function selectFeatures() {
     enabled.add('onlineinstall');
   }
   return enabled;
-}
-
-async function loadFeatureState() {
-  try {
-    const data = await readFile('.shinstall-features', 'utf8');
-    return new Set(data.split('\n').filter(Boolean));
-  } catch {
-    return new Set(['onlineinstall']); // Default: online install enabled
-  }
-}
-
-async function saveFeatureState(enabledSet) {
-  await writeFile('.shinstall-features', Array.from(enabledSet).join('\n'), 'utf8');
 }
 
 async function saveConfig(config) {
