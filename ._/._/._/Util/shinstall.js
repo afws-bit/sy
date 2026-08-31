@@ -2,7 +2,18 @@
 
 /**
  * shinstall.js – Modular install.sh generator
- * Fixed version with proper command link creation and update detection
+ * Enhanced version with comprehensive testing and modular architecture
+ * 
+ * TESTING GUIDE:
+ * To run tests: node shinstall.js --test
+ * 
+ * FOR NEW MODULES:
+ * 1. Add your feature to the 'features' array
+ * 2. Create the feature snippet generator function (e.g., yourFeatureSnippet)
+ * 3. Add feature initialization call in generateInstallSh if needed
+ * 4. Create a test method in TestSuite class: test[FeatureName]()
+ * 5. Add the test call in the runAllTests() method
+ * 6. Test your feature with: node shinstall.js --test
  */
 
 import fs from 'fs';
@@ -268,10 +279,65 @@ function shellFallbackFeatureSnippet(config) {
 # =============================================================================
 # SHELL SCRIPT BASH→ASH FALLBACK (auto-generated)
 # =============================================================================
+SHELL_SCRIPTS_SRC_LIST=""
+SHELL_SCRIPTS_CMD_LIST=""
+
 create_shell_commands() {
-    echo "Creating shell script wrappers..."
-    # This function would create wrappers for each shell script
-    # in the SHELL_SCRIPTS_SRC list, with fallback logic.
+    echo "Creating shell script wrappers with bash/ash fallback..."
+    [ -z "\$SHELL_SCRIPTS_SRC_LIST" ] && return 0
+    
+    idx=1
+    for src in \$SHELL_SCRIPTS_SRC_LIST; do
+        cmd=\$(echo "\$SHELL_SCRIPTS_CMD_LIST" | tr ' ' '\\n' | sed -n "\${idx}p")
+        [ -z "\$cmd" ] && continue
+        
+        src_path="\$INSTALL_DIR/\$src"
+        if [ ! -f "\$src_path" ]; then
+            echo "Warning: Shell script not found: \$src_path"
+            idx=\$((idx + 1))
+            continue
+        fi
+        
+        chmod +x "\$src_path"
+        
+        # Create wrapper with bash fallback to ash
+        wrapper="\$INSTALL_DIR/wrappers/\$cmd"
+        mkdir -p "\$INSTALL_DIR/wrappers"
+        
+        cat > "\$wrapper" << 'WRAPPER_EOF'
+#!/bin/sh
+# Wrapper with bash/ash fallback
+SCRIPT_PATH="\$src_path"
+
+if command -v bash >/dev/null 2>&1; then
+    exec bash "\$SCRIPT_PATH" "\$@"
+elif command -v ash >/dev/null 2>&1; then
+    exec ash "\$SCRIPT_PATH" "\$@"
+else
+    exec sh "\$SCRIPT_PATH" "\$@"
+fi
+WRAPPER_EOF
+        
+        chmod +x "\$wrapper"
+        ln -sf "\$wrapper" "\$BIN_DIR/\$cmd"
+        echo "Created shell command: \$cmd -> \$src_path (with bash/ash fallback)"
+        
+        idx=\$((idx + 1))
+    done
+}
+
+# Helper function to check shell availability
+check_shell_fallback() {
+    if command -v bash >/dev/null 2>&1; then
+        echo "bash available - using bash"
+        return 0
+    elif command -v ash >/dev/null 2>&1; then
+        echo "bash not found - falling back to ash"
+        return 0
+    else
+        echo "Neither bash nor ash found - using default sh"
+        return 0
+    fi
 }
 `;
 }
@@ -325,6 +391,8 @@ NODE_ENTRY_POINTS_CMD="${config.nodeEntryPointsCmd}"
 # Shell script command mapping
 SHELL_SCRIPTS_SRC="${config.shellScriptsSrc}"
 SHELL_SCRIPTS_CMD="${config.shellScriptsCmd}"
+SHELL_SCRIPTS_SRC_LIST="${config.shellScriptsSrc}"
+SHELL_SCRIPTS_CMD_LIST="${config.shellScriptsCmd}"
 `);
   }
 
@@ -585,8 +653,9 @@ create_git_config
 
   if (enabledFeatures.has('shellfallback')) {
     parts.push(`
-# Create shell script commands
+# Create shell script commands with fallback
 create_shell_commands
+check_shell_fallback
 `);
   }
 
@@ -608,6 +677,392 @@ echo "Installation directory: \$INSTALL_DIR"
 `);
 
   return parts.join('\n');
+}
+
+// ==================== TEST SUITE ====================
+// FOR NEW MODULES: Add test methods here following the pattern below
+class TestSuite {
+  constructor() {
+    this.tests = [];
+    this.passed = 0;
+    this.failed = 0;
+    this.testDir = path.join(process.cwd(), '.test-tmp');
+    this.results = [];
+  }
+
+  async setup() {
+    // Create temporary test directory
+    await mkdir(this.testDir, { recursive: true });
+    console.log('🧪 Test Suite Starting...\n');
+    console.log('========================================');
+    console.log('  shinstall.js Test Suite');
+    console.log('========================================\n');
+  }
+
+  async cleanup() {
+    // Clean up test directory
+    try {
+      await execSync(`rm -rf ${this.testDir}`);
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+  }
+
+  assert(condition, message) {
+    if (condition) {
+      this.passed++;
+      this.results.push({ status: '✅ PASS', message });
+      console.log(`✅ PASS: ${message}`);
+    } else {
+      this.failed++;
+      this.results.push({ status: '❌ FAIL', message });
+      console.log(`❌ FAIL: ${message}`);
+    }
+  }
+
+  async assertFileExists(filePath, message) {
+    try {
+      await access(filePath, fs.constants.F_OK);
+      this.assert(true, message || `File exists: ${filePath}`);
+      return true;
+    } catch {
+      this.assert(false, message || `File should exist: ${filePath}`);
+      return false;
+    }
+  }
+
+  async assertFileContains(filePath, content, message) {
+    try {
+      const data = await readFile(filePath, 'utf8');
+      this.assert(data.includes(content), message || `File contains expected content: ${filePath}`);
+      return data.includes(content);
+    } catch (e) {
+      this.assert(false, message || `File should be readable: ${filePath}`);
+      return false;
+    }
+  }
+
+  async testFeatureGeneration() {
+    console.log('\n📦 Testing Feature Generation...');
+    
+    for (const feature of features) {
+      const config = { ...DEFAULTS, projectName: 'TestApp' };
+      const snippet = feature.generate(config);
+      
+      this.assert(
+        typeof snippet === 'string' && snippet.length > 0,
+        `Feature '${feature.id}' generates non-empty snippet`
+      );
+      
+      this.assert(
+        snippet.includes('# ===='),
+        `Feature '${feature.id}' has proper header formatting`
+      );
+    }
+  }
+
+  async testBuildFeature() {
+    console.log('\n🔨 Testing Build Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestBuild' };
+    const snippet = buildFeatureSnippet(config);
+    
+    this.assert(snippet.includes('BUILD_MODE=false'), 'Build feature has BUILD_MODE variable');
+    this.assert(snippet.includes('do_build()'), 'Build feature has do_build function');
+    this.assert(snippet.includes('BUILD_DIR='), 'Build feature has BUILD_DIR variable');
+    this.assert(snippet.includes('BUILD_SAVE_FILE='), 'Build feature has BUILD_SAVE_FILE variable');
+    this.assert(snippet.includes('BUILD_TAR=false'), 'Build feature has BUILD_TAR variable');
+  }
+
+  async testNodeInstallFeature() {
+    console.log('\n📦 Testing Node Install Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestNode' };
+    const snippet = nodeInstallFeatureSnippet(config);
+    
+    this.assert(snippet.includes('INSTALL_NODE=false'), 'Node install has INSTALL_NODE variable');
+    this.assert(snippet.includes('ensure_nodejs()'), 'Node install has ensure_nodejs function');
+    this.assert(snippet.includes('apt'), 'Node install supports apt package manager');
+    this.assert(snippet.includes('apk'), 'Node install supports apk package manager');
+    this.assert(snippet.includes('command -v node'), 'Node install checks for existing node');
+  }
+
+  async testDebInstallFeature() {
+    console.log('\n📦 Testing Debian Package Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestDeb' };
+    const snippet = debInstallFeatureSnippet(config);
+    
+    this.assert(snippet.includes('SKIP_DEBS=false'), 'Deb install has SKIP_DEBS variable');
+    this.assert(snippet.includes('install_debs()'), 'Deb install has install_debs function');
+    this.assert(snippet.includes('dpkg -i'), 'Deb install uses dpkg command');
+    this.assert(snippet.includes('DEB_DIR='), 'Deb install has DEB_DIR variable');
+  }
+
+  async testPm2ExtractFeature() {
+    console.log('\n📦 Testing PM2 Extract Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestPm2' };
+    const snippet = pm2ExtractFeatureSnippet(config);
+    
+    this.assert(snippet.includes('PM2_TAR_GZ='), 'PM2 extract has PM2_TAR_GZ variable');
+    this.assert(snippet.includes('extract_pm2()'), 'PM2 extract has extract_pm2 function');
+    this.assert(snippet.includes('tar -xzf'), 'PM2 extract uses tar command');
+    this.assert(snippet.includes('PM2_EXTRACT_DIR='), 'PM2 extract has PM2_EXTRACT_DIR variable');
+  }
+
+  async testPkgCliFeature() {
+    console.log('\n📦 Testing pkg CLI Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestPkg' };
+    const snippet = pkgCliFeatureSnippet(config);
+    
+    this.assert(snippet.includes('create_pkg_cli()'), 'pkg CLI has create_pkg_cli function');
+    this.assert(snippet.includes('pkg-cli.js'), 'pkg CLI creates pkg-cli.js file');
+    this.assert(snippet.includes('ln -sf'), 'pkg CLI creates symbolic link');
+  }
+
+  async testWsaveFeature() {
+    console.log('\n📦 Testing wsave Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestWsave' };
+    const snippet = wsaveFeatureSnippet(config);
+    
+    this.assert(snippet.includes('create_wsave()'), 'wsave has create_wsave function');
+    this.assert(snippet.includes('chown -R'), 'wsave uses chown command');
+    this.assert(snippet.includes('chmod -R'), 'wsave uses chmod command');
+    this.assert(snippet.includes('SUDO_USER'), 'wsave handles sudo user');
+  }
+
+  async testGitConfigFeature() {
+    console.log('\n📦 Testing git-config Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestGit' };
+    const snippet = gitConfigFeatureSnippet(config);
+    
+    this.assert(snippet.includes('create_git_config()'), 'git-config has create_git_config function');
+    this.assert(snippet.includes('Git.js'), 'git-config looks for Git.js');
+    this.assert(snippet.includes('git-config'), 'git-config creates command link');
+  }
+
+  async testShellFallbackFeature() {
+    console.log('\n📦 Testing Shell Fallback Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestShell' };
+    const snippet = shellFallbackFeatureSnippet(config);
+    
+    this.assert(snippet.includes('create_shell_commands()'), 'Shell fallback has create_shell_commands function');
+    this.assert(snippet.includes('SHELL_SCRIPTS_SRC_LIST'), 'Shell fallback has SHELL_SCRIPTS_SRC_LIST variable');
+    this.assert(snippet.includes('SHELL_SCRIPTS_CMD_LIST'), 'Shell fallback has SHELL_SCRIPTS_CMD_LIST variable');
+    this.assert(snippet.includes('command -v bash'), 'Shell fallback checks for bash availability');
+    this.assert(snippet.includes('command -v ash'), 'Shell fallback checks for ash availability');
+    this.assert(snippet.includes('check_shell_fallback()'), 'Shell fallback has check_shell_fallback function');
+    this.assert(snippet.includes('bash/ash fallback'), 'Shell fallback mentions bash/ash fallback');
+    this.assert(snippet.includes('exec bash'), 'Shell fallback executes with bash when available');
+    this.assert(snippet.includes('exec ash'), 'Shell fallback executes with ash as fallback');
+    this.assert(snippet.includes('falling back to ash'), 'Shell fallback has fallback message');
+    this.assert(snippet.includes('Neither bash nor ash'), 'Shell fallback handles missing shells');
+  }
+
+  async testOldWrapperFeature() {
+    console.log('\n📦 Testing Old Wrapper Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestOld' };
+    const snippet = oldWrapperFeatureSnippet(config);
+    
+    this.assert(snippet.includes('OLD_SCRIPT_PATH'), 'Old wrapper has OLD_SCRIPT_PATH variable');
+    this.assert(snippet.includes('old-install.sh'), 'Old wrapper references old-install.sh');
+    this.assert(snippet.includes('--old'), 'Old wrapper checks for --old flag');
+  }
+
+  async testGenerateInstallSh() {
+    console.log('\n🔧 Testing install.sh Generation...');
+    
+    const config = {
+      ...DEFAULTS,
+      projectName: 'TestApp',
+      installDir: '/tmp/test-install',
+      binDir: '/tmp/test-bin',
+      nodeEntryPointsSrc: 'app.js server.js',
+      nodeEntryPointsCmd: 'myapp myserver'
+    };
+    
+    // Test with no features
+    const emptyFeatures = new Set();
+    const basicScript = generateInstallSh(config, emptyFeatures);
+    
+    this.assert(basicScript.includes('#!/bin/sh'), 'Generated script has shebang');
+    this.assert(basicScript.includes('PROJECT_NAME="TestApp"'), 'Generated script has project name');
+    this.assert(basicScript.includes('create_command_links()'), 'Generated script has create_command_links function');
+    this.assert(basicScript.includes('copy_files()'), 'Generated script has copy_files function');
+    this.assert(basicScript.includes('remove_links()'), 'Generated script has remove_links function');
+    this.assert(basicScript.includes('execute_post_install_scripts()'), 'Generated script has execute_post_install_scripts function');
+    this.assert(!basicScript.includes('do_build()'), 'Basic script does not include build feature');
+    this.assert(!basicScript.includes('ensure_nodejs()'), 'Basic script does not include node install feature');
+    
+    // Test with all features
+    const allFeatures = new Set(features.map(f => f.id));
+    const fullScript = generateInstallSh(config, allFeatures);
+    
+    this.assert(fullScript.includes('do_build()'), 'Full script includes build feature');
+    this.assert(fullScript.includes('ensure_nodejs()'), 'Full script includes node install');
+    this.assert(fullScript.includes('install_debs()'), 'Full script includes deb install');
+    this.assert(fullScript.includes('extract_pm2()'), 'Full script includes PM2 extract');
+    this.assert(fullScript.includes('create_pkg_cli()'), 'Full script includes pkg CLI');
+    this.assert(fullScript.includes('create_wsave()'), 'Full script includes wsave');
+    this.assert(fullScript.includes('create_git_config()'), 'Full script includes git-config');
+    this.assert(fullScript.includes('create_shell_commands()'), 'Full script includes shell fallback');
+    
+    // Write test scripts to verify they're valid
+    await writeFile(path.join(this.testDir, 'basic-install.sh'), basicScript, 'utf8');
+    await writeFile(path.join(this.testDir, 'full-install.sh'), fullScript, 'utf8');
+    
+    await this.assertFileExists(
+      path.join(this.testDir, 'basic-install.sh'),
+      'Basic install.sh file created'
+    );
+    
+    await this.assertFileExists(
+      path.join(this.testDir, 'full-install.sh'),
+      'Full install.sh file created'
+    );
+    
+    // Verify shell script syntax (if bash is available)
+    try {
+      execSync(`bash -n ${path.join(this.testDir, 'basic-install.sh')}`);
+      this.assert(true, 'Basic install.sh has valid bash syntax');
+    } catch (e) {
+      this.assert(false, 'Basic install.sh has valid bash syntax');
+    }
+    
+    try {
+      execSync(`bash -n ${path.join(this.testDir, 'full-install.sh')}`);
+      this.assert(true, 'Full install.sh has valid bash syntax');
+    } catch (e) {
+      this.assert(false, 'Full install.sh has valid bash syntax');
+    }
+  }
+
+  async testFileOperations() {
+    console.log('\n📁 Testing File Operations...');
+    
+    // Test fileExists
+    const testFile = path.join(this.testDir, 'test-file.txt');
+    await writeFile(testFile, 'test content', 'utf8');
+    this.assert(await fileExists(testFile), 'fileExists returns true for existing file');
+    this.assert(!await fileExists(path.join(this.testDir, 'nonexistent.txt')), 'fileExists returns false for missing file');
+    
+    // Test copyFile
+    const copiedFile = path.join(this.testDir, 'copied-file.txt');
+    await copyFile(testFile, copiedFile);
+    await this.assertFileExists(copiedFile, 'copyFile creates copy');
+    
+    // Test rename
+    const renamedFile = path.join(this.testDir, 'renamed-file.txt');
+    await rename(testFile, renamedFile);
+    await this.assertFileExists(renamedFile, 'rename moves file');
+    this.assert(!await fileExists(testFile), 'Original file removed after rename');
+    
+    // Test unlink
+    await unlink(renamedFile);
+    this.assert(!await fileExists(renamedFile), 'unlink removes file');
+    
+    // Test mkdir
+    const testDir = path.join(this.testDir, 'subdir');
+    await mkdir(testDir, { recursive: true });
+    await this.assertFileExists(testDir, 'mkdir creates directory');
+  }
+
+  async testConfigManagement() {
+    console.log('\n⚙️ Testing Configuration Management...');
+    
+    const testConfig = {
+      ...DEFAULTS,
+      projectName: 'ConfigTest',
+      installDir: '/tmp/config-test',
+      nodeEntryPointsSrc: 'test.js',
+      nodeEntryPointsCmd: 'testcmd'
+    };
+    
+    // Test saveConfig
+    await saveConfig(testConfig);
+    const configFile = path.join(process.cwd(), '.shinstallrc');
+    await this.assertFileExists(configFile, 'saveConfig creates .shinstallrc');
+    
+    // Test loadConfig
+    const loadedConfig = await loadConfig();
+    this.assert(
+      loadedConfig.projectName === 'ConfigTest',
+      'loadConfig returns saved configuration'
+    );
+    this.assert(
+      loadedConfig.installDir === '/tmp/config-test',
+      'loadConfig returns correct install directory'
+    );
+    this.assert(
+      loadedConfig.nodeEntryPointsSrc === 'test.js',
+      'loadConfig returns correct node entry point'
+    );
+    
+    // Clean up config file
+    try {
+      await unlink(configFile);
+    } catch (e) {
+      // Ignore if file doesn't exist
+    }
+  }
+
+  async runAllTests() {
+    const startTime = Date.now();
+    
+    await this.setup();
+    
+    try {
+      // Core functionality tests
+      await this.testFeatureGeneration();
+      await this.testGenerateInstallSh();
+      await this.testFileOperations();
+      await this.testConfigManagement();
+      
+      // Individual feature tests
+      // FOR NEW MODULES: Add your test call here
+      await this.testBuildFeature();
+      await this.testNodeInstallFeature();
+      await this.testDebInstallFeature();
+      await this.testPm2ExtractFeature();
+      await this.testPkgCliFeature();
+      await this.testWsaveFeature();
+      await this.testGitConfigFeature();
+      await this.testShellFallbackFeature();
+      await this.testOldWrapperFeature();
+      
+    } catch (error) {
+      console.error('❌ Test suite error:', error);
+      this.failed++;
+    } finally {
+      await this.cleanup();
+    }
+    
+    const endTime = Date.now();
+    const duration = (endTime - startTime) / 1000;
+    
+    console.log('\n========================================');
+    console.log('  Test Results Summary');
+    console.log('========================================');
+    console.log(`Total tests: ${this.passed + this.failed}`);
+    console.log(`Passed: ${this.passed} ✅`);
+    console.log(`Failed: ${this.failed} ❌`);
+    console.log(`Duration: ${duration.toFixed(2)} seconds`);
+    console.log('========================================\n');
+    
+    if (this.failed > 0) {
+      console.log('❌ Some tests failed. Please review the output above.');
+      process.exit(1);
+    } else {
+      console.log('✅ All tests passed successfully!');
+      console.log('The system is working correctly. You can safely add new modules.');
+    }
+  }
 }
 
 // ==================== INTERACTIVE MENU ====================
@@ -633,6 +1088,7 @@ async function interactiveMenu() {
   console.log('5. Configure project settings');
   console.log('6. Generate old-install.sh wrapper (--old support)');
   console.log('7. Remove old-install.sh');
+  console.log('8. Run test suite');
   console.log('0. Exit');
   console.log('');
 
@@ -660,6 +1116,10 @@ async function interactiveMenu() {
       break;
     case '7':
       await removeOldWrapper();
+      break;
+    case '8':
+      const testSuite = new TestSuite();
+      await testSuite.runAllTests();
       break;
     case '0':
       console.log('Goodbye!');
@@ -857,6 +1317,15 @@ async function loadConfig() {
 
 async function main() {
   const args = process.argv.slice(2);
+  
+  // Run tests if --test flag is provided
+  if (args.includes('--test') || args.includes('-t')) {
+    console.log('Running test suite...\n');
+    const testSuite = new TestSuite();
+    await testSuite.runAllTests();
+    return;
+  }
+  
   if (args.includes('--help') || args.includes('-h')) {
     console.log(`
 shinstall.js – Modular install.sh generator
@@ -867,7 +1336,15 @@ Usage:
   node shinstall.js --emb         Backup existing install.sh as old-install.sh and generate new
   node shinstall.js --old         Generate an old-install.sh wrapper
   node shinstall.js --no-old      Remove the old-install.sh wrapper
+  node shinstall.js --test        Run test suite to verify all modules
   node shinstall.js --help        Show this help
+
+For new modules:
+  1. Add your feature to the 'features' array
+  2. Create a test method in TestSuite class following the pattern: test[FeatureName]()
+  3. Add the test call in the runAllTests() method
+  4. Ensure your test validates: feature generation, integration, and error handling
+  5. Run tests with: node shinstall.js --test
 `);
     process.exit(0);
   }
