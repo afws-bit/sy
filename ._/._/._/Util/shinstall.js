@@ -129,6 +129,14 @@ const features = [
     description: 'Generate a wrapper to run the old install.sh with --old.',
     default: false,
     generate: (config) => oldWrapperFeatureSnippet(config)
+  },
+  // ==================== NEW FEATURE: Multi-language support ====================
+  {
+    id: 'multilang',
+    name: 'Multi-language support',
+    description: 'Support for multiple programming languages (C, C++, Java, Python, Node.js, Shell) with automatic compilation and online dependency installation.',
+    default: false,
+    generate: (config) => multilangFeatureSnippet(config)
   }
 ];
 
@@ -355,6 +363,183 @@ fi
 `;
 }
 
+// ==================== NEW FEATURE: MULTI-LANGUAGE SUPPORT ====================
+function multilangFeatureSnippet(config) {
+  return `
+# =============================================================================
+# MULTI-LANGUAGE SUPPORT (auto-generated)
+# =============================================================================
+ONLINE_MODE=false
+
+# Helper: check if a command exists
+command_exists() {
+    command -v "\$1" >/dev/null 2>&1
+}
+
+# Helper: install packages via apt
+install_apt() {
+    sudo apt update && sudo apt install -y "\$@"
+}
+
+# Helper: install packages via apk
+install_apk() {
+    apk add --no-cache "\$@"
+}
+
+# Install missing language dependencies (if --online is set)
+install_language_deps() {
+    [ "\$ONLINE_MODE" = true ] || return 0
+    echo "Checking and installing language dependencies..."
+    for src in \$NODE_ENTRY_POINTS_SRC; do
+        ext="\${src##*.}"
+        case "\$ext" in
+            js)
+                if ! command_exists node; then
+                    echo "Node.js not found. Installing..."
+                    if command_exists apt; then install_apt nodejs;
+                    elif command_exists apk; then install_apk nodejs npm;
+                    else echo "No supported package manager found."; fi
+                fi
+                ;;
+            py)
+                if ! command_exists python3; then
+                    echo "Python3 not found. Installing..."
+                    if command_exists apt; then install_apt python3;
+                    elif command_exists apk; then install_apk python3;
+                    else echo "No supported package manager found."; fi
+                fi
+                ;;
+            c)
+                if ! command_exists gcc; then
+                    echo "GCC not found. Installing..."
+                    if command_exists apt; then install_apt gcc;
+                    elif command_exists apk; then install_apk build-base;
+                    else echo "No supported package manager found."; fi
+                fi
+                ;;
+            cpp|cc|cxx)
+                if ! command_exists g++; then
+                    echo "G++ not found. Installing..."
+                    if command_exists apt; then install_apt g++;
+                    elif command_exists apk; then install_apk g++;
+                    else echo "No supported package manager found."; fi
+                fi
+                ;;
+            java)
+                if ! command_exists javac || ! command_exists java; then
+                    echo "Java not found. Installing..."
+                    if command_exists apt; then install_apt default-jdk;
+                    elif command_exists apk; then install_apk openjdk11;
+                    else echo "No supported package manager found."; fi
+                fi
+                ;;
+            sh)
+                # shell scripts need no special runtime
+                ;;
+            *)
+                echo "Unknown extension: \$ext - skipping dependency check."
+                ;;
+        esac
+    done
+}
+
+# Enhanced create_command_links for multi-language (overrides default)
+create_command_links() {
+    echo "Creating command links with multi-language support..."
+    idx=1
+    for src in \$NODE_ENTRY_POINTS_SRC; do
+        cmd=\$(echo "\$NODE_ENTRY_POINTS_CMD" | tr ' ' '\\n' | sed -n "\${idx}p")
+        [ -z "\$cmd" ] && continue
+        src_path="\$INSTALL_DIR/\$src"
+        if [ ! -f "\$src_path" ]; then
+            echo "Warning: Source file not found: \$src_path"
+            idx=\$((idx + 1))
+            continue
+        fi
+        ext="\${src##*.}"
+        wrapper="\$INSTALL_DIR/wrappers/\$cmd"
+        mkdir -p "\$INSTALL_DIR/wrappers"
+        case "\$ext" in
+            js)
+                # Node.js
+                cat > "\$wrapper" << EOF
+#!/bin/sh
+exec node "\$src_path" "\\\$@"
+EOF
+                ;;
+            py)
+                # Python
+                cat > "\$wrapper" << EOF
+#!/bin/sh
+exec python3 "\$src_path" "\\\$@"
+EOF
+                ;;
+            c)
+                # C: compile to binary in \$INSTALL_DIR/bin
+                bin_path="\$INSTALL_DIR/bin/\$cmd"
+                mkdir -p "\$INSTALL_DIR/bin"
+                gcc -o "\$bin_path" "\$src_path" || { echo "Compilation failed for \$src"; idx=\$((idx+1)); continue; }
+                cat > "\$wrapper" << EOF
+#!/bin/sh
+exec "\$bin_path" "\\\$@"
+EOF
+                ;;
+            cpp|cc|cxx)
+                # C++
+                bin_path="\$INSTALL_DIR/bin/\$cmd"
+                mkdir -p "\$INSTALL_DIR/bin"
+                g++ -o "\$bin_path" "\$src_path" || { echo "Compilation failed for \$src"; idx=\$((idx+1)); continue; }
+                cat > "\$wrapper" << EOF
+#!/bin/sh
+exec "\$bin_path" "\\\$@"
+EOF
+                ;;
+            java)
+                # Java: compile to .class files in \$INSTALL_DIR/classes
+                classes_dir="\$INSTALL_DIR/classes"
+                mkdir -p "\$classes_dir"
+                javac -d "\$classes_dir" "\$src_path" || { echo "Compilation failed for \$src"; idx=\$((idx+1)); continue; }
+                main_class=\$(basename "\$src" .java)
+                cat > "\$wrapper" << EOF
+#!/bin/sh
+exec java -cp "\$classes_dir" "\$main_class" "\\\$@"
+EOF
+                ;;
+            sh)
+                # Shell script: make executable and link directly
+                chmod +x "\$src_path"
+                wrapper="\$src_path"
+                ;;
+            *)
+                echo "Unsupported extension: \$ext - skipping."
+                idx=\$((idx + 1))
+                continue
+                ;;
+        esac
+        chmod +x "\$wrapper"
+        if [ "\$wrapper" != "\$src_path" ]; then
+            ln -sf "\$wrapper" "\$BIN_DIR/\$cmd"
+        else
+            ln -sf "\$src_path" "\$BIN_DIR/\$cmd"
+        fi
+        echo "Created command: \$cmd -> \$src_path"
+        idx=\$((idx + 1))
+    done
+}
+
+# Enhanced remove_links to also clean compiled artifacts
+remove_links() {
+    cmd_list="\$NODE_ENTRY_POINTS_CMD"
+    for cmd in \$cmd_list; do
+        [ -L "\$BIN_DIR/\$cmd" ] && rm -f "\$BIN_DIR/\$cmd"
+    done
+    [ -d "\$INSTALL_DIR/wrappers" ] && rm -rf "\$INSTALL_DIR/wrappers"
+    [ -d "\$INSTALL_DIR/bin" ] && rm -rf "\$INSTALL_DIR/bin"
+    [ -d "\$INSTALL_DIR/classes" ] && rm -rf "\$INSTALL_DIR/classes"
+}
+`;
+}
+
 // ==================== INSTALL.SH TEMPLATE ASSEMBLY ====================
 
 function generateInstallSh(config, enabledFeatures) {
@@ -380,7 +565,7 @@ BACKUP_DIR="\${INSTALL_DIR}_old_\$(date +%s)"
 
   // Node command mapping (always present)
   parts.push(`
-# Node.js command mapping
+# Node.js command mapping (generic: supports any language)
 NODE_ENTRY_POINTS_SRC="${config.nodeEntryPointsSrc}"
 NODE_ENTRY_POINTS_CMD="${config.nodeEntryPointsCmd}"
 `);
@@ -506,6 +691,7 @@ show_help() {
     echo "Options:"
     echo "  -h, --help       Show this help"
     echo "  --node           Auto-install Node.js if missing"
+    echo "  --online         Install missing language dependencies (with multilang feature)"
     echo "  --force          Force update without asking"
     echo "  --remove         Remove existing installation"
     echo ""
@@ -537,6 +723,7 @@ while [ \$# -gt 0 ]; do
     case "\$1" in
         -h|--help) show_help; exit 0 ;;
         --node|--nodejs) INSTALL_NODE=true ;;
+        --online) ONLINE_MODE=true ;;
         --build) BUILD_MODE=true ;;
         --tar) BUILD_TAR=true ;;
         --config) BUILD_CONFIG=true ;;
@@ -613,6 +800,14 @@ install_debs
 `);
   }
 
+  // If multi-language is enabled, we must call install_language_deps before compilation
+  if (enabledFeatures.has('multilang')) {
+    parts.push(`
+# Install missing language dependencies if --online was passed
+install_language_deps
+`);
+  }
+
   parts.push(`
 # Create installation directory and copy files
 copy_files
@@ -625,6 +820,7 @@ extract_pm2
 `);
   }
 
+  // The call to create_command_links will now use the overridden version if multilang is enabled
   parts.push(`
 # Create command links
 create_command_links
@@ -875,6 +1071,31 @@ class TestSuite {
     this.assert(snippet.includes('--old'), 'Old wrapper checks for --old flag');
   }
 
+  // ==================== NEW TEST: Multi-language Feature ====================
+  async testMultilangFeature() {
+    console.log('\n🌐 Testing Multi-language Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestMulti' };
+    const snippet = multilangFeatureSnippet(config);
+    
+    // Check key components
+    this.assert(snippet.includes('MULTI-LANGUAGE SUPPORT'), 'Multi-language feature has header');
+    this.assert(snippet.includes('ONLINE_MODE=false'), 'Multi-language has ONLINE_MODE variable');
+    this.assert(snippet.includes('install_language_deps()'), 'Multi-language has install_language_deps function');
+    this.assert(snippet.includes('command_exists()'), 'Multi-language has command_exists helper');
+    this.assert(snippet.includes('install_apt()'), 'Multi-language has install_apt helper');
+    this.assert(snippet.includes('install_apk()'), 'Multi-language has install_apk helper');
+    this.assert(snippet.includes('create_command_links()'), 'Multi-language overrides create_command_links');
+    this.assert(snippet.includes('gcc -o'), 'Multi-language compiles C code');
+    this.assert(snippet.includes('g++ -o'), 'Multi-language compiles C++ code');
+    this.assert(snippet.includes('javac -d'), 'Multi-language compiles Java code');
+    this.assert(snippet.includes('exec python3'), 'Multi-language runs Python scripts');
+    this.assert(snippet.includes('exec node'), 'Multi-language runs Node.js scripts');
+    this.assert(snippet.includes('remove_links()'), 'Multi-language overrides remove_links');
+    this.assert(snippet.includes('rm -rf "$INSTALL_DIR/bin"'), 'Multi-language cleans compiled binaries on removal');
+    this.assert(snippet.includes('rm -rf "$INSTALL_DIR/classes"'), 'Multi-language cleans Java classes on removal');
+  }
+
   async testGenerateInstallSh() {
     console.log('\n🔧 Testing install.sh Generation...');
     
@@ -883,8 +1104,8 @@ class TestSuite {
       projectName: 'TestApp',
       installDir: '/tmp/test-install',
       binDir: '/tmp/test-bin',
-      nodeEntryPointsSrc: 'app.js server.js',
-      nodeEntryPointsCmd: 'myapp myserver'
+      nodeEntryPointsSrc: 'app.js server.py main.c',
+      nodeEntryPointsCmd: 'myapp myserver mybinary'
     };
     
     // Test with no features
@@ -900,7 +1121,7 @@ class TestSuite {
     this.assert(!basicScript.includes('do_build()'), 'Basic script does not include build feature');
     this.assert(!basicScript.includes('ensure_nodejs()'), 'Basic script does not include node install feature');
     
-    // Test with all features
+    // Test with all features including multilang
     const allFeatures = new Set(features.map(f => f.id));
     const fullScript = generateInstallSh(config, allFeatures);
     
@@ -912,6 +1133,8 @@ class TestSuite {
     this.assert(fullScript.includes('create_wsave()'), 'Full script includes wsave');
     this.assert(fullScript.includes('create_git_config()'), 'Full script includes git-config');
     this.assert(fullScript.includes('create_shell_commands()'), 'Full script includes shell fallback');
+    this.assert(fullScript.includes('install_language_deps()'), 'Full script includes multi-language dependency installer');
+    this.assert(fullScript.includes('gcc -o'), 'Full script includes C compilation in multilang');
     
     // Write test scripts to verify they're valid
     await writeFile(path.join(this.testDir, 'basic-install.sh'), basicScript, 'utf8');
@@ -1035,6 +1258,7 @@ class TestSuite {
       await this.testGitConfigFeature();
       await this.testShellFallbackFeature();
       await this.testOldWrapperFeature();
+      await this.testMultilangFeature();  // NEW
       
     } catch (error) {
       console.error('❌ Test suite error:', error);
@@ -1198,8 +1422,8 @@ async function configureSettings() {
   console.log('\n--- Configure Project Settings ---');
   const projectName = await question(`Project name (default: ${DEFAULTS.projectName}): `);
   const installDir = await question(`Install directory (default: ${DEFAULTS.installDir}): `);
-  const nodeSrc = await question(`Node entry point source (default: ${DEFAULTS.nodeEntryPointsSrc}): `);
-  const nodeCmd = await question(`Node command name (default: ${DEFAULTS.nodeEntryPointsCmd}): `);
+  const nodeSrc = await question(`Entry point source(s) space-separated (default: ${DEFAULTS.nodeEntryPointsSrc}): `);
+  const nodeCmd = await question(`Command name(s) space-separated (default: ${DEFAULTS.nodeEntryPointsCmd}): `);
   const config = {
     ...DEFAULTS,
     projectName: projectName || DEFAULTS.projectName,
@@ -1209,6 +1433,7 @@ async function configureSettings() {
   };
   await saveConfig(config);
   console.log('Settings saved to .shinstallrc');
+  console.log('Note: Language is inferred from file extension (.js, .py, .c, .cpp, .java, .sh).');
 }
 
 async function generateOldWrapper() {
@@ -1262,10 +1487,11 @@ async function gatherProjectConfig() {
   if (projectName) config.projectName = projectName;
   const installDir = await question(`Install directory (${config.installDir}): `);
   if (installDir) config.installDir = installDir;
-  const nodeSrc = await question(`Node entry point source (${config.nodeEntryPointsSrc}): `);
+  const nodeSrc = await question(`Entry point source(s) space-separated (${config.nodeEntryPointsSrc}): `);
   if (nodeSrc) config.nodeEntryPointsSrc = nodeSrc;
-  const nodeCmd = await question(`Node command name (${config.nodeEntryPointsCmd}): `);
+  const nodeCmd = await question(`Command name(s) space-separated (${config.nodeEntryPointsCmd}): `);
   if (nodeCmd) config.nodeEntryPointsCmd = nodeCmd;
+  console.log('Note: Language is inferred from file extension (.js, .py, .c, .cpp, .java, .sh).');
   return config;
 }
 
