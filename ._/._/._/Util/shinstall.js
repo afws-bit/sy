@@ -130,6 +130,15 @@ const features = [
     description: 'Install missing language dependencies when --online is passed.',
     default: true,
     generate: (config) => onlineInstallFeatureSnippet(config)
+  },
+  {
+    id: 'onlineforced',
+    name: 'Force online dependency installation',
+    description: 'Make --online mandatory - always check and install dependencies automatically.',
+    default: true,
+    generate: (config) => onlineForcedFeatureSnippet(config),
+    requires: ['onlineinstall'],
+    autoEnableWith: ['onlineinstall']
   }
 ];
 
@@ -449,6 +458,31 @@ install_language_deps() {
     fi
     
     echo "=== Language dependencies check completed ==="
+}
+`;
+}
+
+// ==================== NEW: ONLINE FORCED FEATURE ====================
+function onlineForcedFeatureSnippet(config) {
+  return `
+# =============================================================================
+# FORCED ONLINE DEPENDENCY INSTALLATION (auto-generated)
+# This feature makes --online mandatory and always active
+# =============================================================================
+FORCED_ONLINE_MODE=true
+
+# Override ONLINE_MODE to always be true
+force_online_mode() {
+    ONLINE_MODE=true
+    echo "Online dependency installation is FORCED and always active."
+    echo "All missing language dependencies will be automatically installed."
+}
+
+# Enhanced dependency checker that always runs
+check_and_install_dependencies_forced() {
+    echo "=== Forced dependency check (cannot be disabled) ==="
+    install_language_deps
+    echo "=== Forced dependency check completed ==="
 }
 `;
 }
@@ -781,6 +815,16 @@ while [ \$# -gt 0 ]; do
 done
 `);
 
+  // Check if forced online mode is enabled
+  if (enabledFeatures.has('onlineforced')) {
+    parts.push(`
+# Force online mode if the feature is enabled
+if [ "\$FORCED_ONLINE_MODE" = true ]; then
+    force_online_mode
+fi
+`);
+  }
+
   // Check for existing installation
   parts.push(`
 # Check if already installed
@@ -843,6 +887,14 @@ install_debs
     parts.push(`
 # Install missing language dependencies if --online was passed
 install_language_deps
+`);
+  }
+
+  // If forced online mode is enabled, always run dependency check
+  if (enabledFeatures.has('onlineforced')) {
+    parts.push(`
+# Always run dependency check (forced online mode)
+check_and_install_dependencies_forced
 `);
   }
 
@@ -1096,6 +1148,31 @@ class TestSuite {
     this.assert(snippet.includes('install_apk()'), 'Online install has install_apk helper');
   }
 
+  async testOnlineForcedFeature() {
+    console.log('\n📦 Testing Online Forced Feature...');
+    
+    const config = { ...DEFAULTS, projectName: 'TestOnlineForced' };
+    const snippet = onlineForcedFeatureSnippet(config);
+    
+    this.assert(snippet.includes('FORCED_ONLINE_MODE=true'), 'Online forced has FORCED_ONLINE_MODE variable');
+    this.assert(snippet.includes('force_online_mode()'), 'Online forced has force_online_mode function');
+    this.assert(snippet.includes('check_and_install_dependencies_forced()'), 'Online forced has forced dependency checker');
+    
+    // Test integration with onlineinstall
+    const enabledFeatures = new Set(['onlineinstall', 'onlineforced']);
+    const generatedScript = generateInstallSh(config, enabledFeatures);
+    
+    this.assert(generatedScript.includes('FORCED_ONLINE_MODE=true'), 'Generated script includes forced online mode');
+    this.assert(generatedScript.includes('force_online_mode'), 'Generated script includes force_online_mode function');
+    this.assert(generatedScript.includes('check_and_install_dependencies_forced'), 'Generated script includes forced dependency check');
+    
+    // Test that forced mode overrides online mode
+    this.assert(
+      generatedScript.includes('ONLINE_MODE=true'),
+      'Forced mode sets ONLINE_MODE to true'
+    );
+  }
+
   async testGenerateInstallSh() {
     console.log('\n🔧 Testing install.sh Generation...');
     
@@ -1129,12 +1206,26 @@ class TestSuite {
     this.assert(basicScript.includes('exec python3'), 'Script includes Python execution');
     this.assert(basicScript.includes('gcc -o'), 'Script includes C compilation');
     
-    // Write test script to verify it's valid
+    // Test with forced online mode
+    const forcedFeatures = new Set(['onlineinstall', 'onlineforced']);
+    const forcedScript = generateInstallSh(config, forcedFeatures);
+    
+    this.assert(forcedScript.includes('FORCED_ONLINE_MODE=true'), 'Forced script includes FORCED_ONLINE_MODE');
+    this.assert(forcedScript.includes('force_online_mode'), 'Forced script includes force_online_mode function');
+    this.assert(forcedScript.includes('check_and_install_dependencies_forced'), 'Forced script includes check_and_install_dependencies_forced');
+    
+    // Write test scripts to verify syntax
     await writeFile(path.join(this.testDir, 'java-install.sh'), basicScript, 'utf8');
+    await writeFile(path.join(this.testDir, 'java-install-forced.sh'), forcedScript, 'utf8');
     
     await this.assertFileExists(
       path.join(this.testDir, 'java-install.sh'),
       'Java install.sh file created'
+    );
+    
+    await this.assertFileExists(
+      path.join(this.testDir, 'java-install-forced.sh'),
+      'Java install.sh with forced online created'
     );
     
     // Verify shell script syntax
@@ -1143,6 +1234,13 @@ class TestSuite {
       this.assert(true, 'Java install.sh has valid bash syntax');
     } catch (e) {
       this.assert(false, 'Java install.sh has valid bash syntax');
+    }
+    
+    try {
+      execSync(`bash -n ${path.join(this.testDir, 'java-install-forced.sh')}`);
+      this.assert(true, 'Java install.sh with forced online has valid bash syntax');
+    } catch (e) {
+      this.assert(false, 'Java install.sh with forced online has valid bash syntax');
     }
   }
 
@@ -1225,6 +1323,7 @@ class TestSuite {
       await this.testShellFallbackFeature();
       await this.testOldWrapperFeature();
       await this.testOnlineInstallFeature();
+      await this.testOnlineForcedFeature();
       
     } catch (error) {
       console.error('❌ Test suite error:', error);
@@ -1359,8 +1458,8 @@ async function eatOldScript() {
 
 async function toggleFeatures() {
   console.log('\n--- Toggle Features ---');
-  // Use in-memory feature set, always start with onlineinstall enabled
-  const enabled = new Set(['onlineinstall']);
+  // Use in-memory feature set, always start with onlineinstall and onlineforced enabled
+  const enabled = new Set(['onlineinstall', 'onlineforced']);
   
   console.log('Current feature states (enable/disable):');
   for (let i = 0; i < features.length; i++) {
@@ -1373,8 +1472,24 @@ async function toggleFeatures() {
     if (num === 0) break;
     if (num >= 1 && num <= features.length) {
       const id = features[num - 1].id;
-      if (enabled.has(id)) enabled.delete(id);
-      else enabled.add(id);
+      
+      // If trying to disable onlineforced but onlineinstall is still enabled
+      if (id === 'onlineinstall' && enabled.has('onlineinstall') && enabled.has('onlineforced')) {
+        console.log('Note: Disabling onlineinstall will also disable forced online mode.');
+        enabled.delete('onlineforced');
+      }
+      
+      // If trying to enable onlineforced without onlineinstall
+      if (id === 'onlineforced' && !enabled.has('onlineforced') && !enabled.has('onlineinstall')) {
+        console.log('Note: Enabling forced online mode will also enable online dependency installation.');
+        enabled.add('onlineinstall');
+      }
+      
+      if (enabled.has(id)) {
+        enabled.delete(id);
+      } else {
+        enabled.add(id);
+      }
       console.log(`Toggled ${features[num - 1].name} to ${enabled.has(id) ? 'ON' : 'OFF'}.`);
     } else {
       console.log('Invalid number.');
@@ -1473,24 +1588,39 @@ async function gatherProjectConfig() {
 }
 
 async function selectFeatures() {
-  console.log('\nSelect features to enable (comma separated numbers, "all", or press Enter for none):');
+  console.log('\nSelect features to enable (comma separated numbers, "all", or press Enter for defaults):');
   for (let i = 0; i < features.length; i++) {
     console.log(`${i + 1}. ${features[i].name} - ${features[i].description}`);
   }
   const input = await question('Selection: ');
   const enabled = new Set();
+  
   if (input.trim().toLowerCase() === 'all') {
     features.forEach(f => enabled.add(f.id));
   } else if (input.trim() !== '') {
     const nums = input.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
     nums.forEach(n => {
-      if (n >= 1 && n <= features.length) enabled.add(features[n - 1].id);
+      if (n >= 1 && n <= features.length) {
+        const feature = features[n - 1];
+        enabled.add(feature.id);
+        
+        // Auto-enable required features
+        if (feature.requires) {
+          feature.requires.forEach(req => enabled.add(req));
+        }
+        
+        // Auto-enable features that this feature works with
+        if (feature.autoEnableWith) {
+          feature.autoEnableWith.forEach(auto => enabled.add(auto));
+        }
+      }
     });
-  }
-  // Always enable onlineinstall by default
-  if (!enabled.has('onlineinstall')) {
+  } else {
+    // Default: enable onlineinstall and onlineforced
     enabled.add('onlineinstall');
+    enabled.add('onlineforced');
   }
+  
   return enabled;
 }
 
@@ -1535,6 +1665,10 @@ Usage:
 Multi-language support is ALWAYS enabled:
   .js → Node.js | .py → Python | .c → C | .cpp/.cc → C++ | .java → Java | .sh → Shell
 
+Features:
+  - Online dependency installation (--online flag)
+  - Forced online dependency installation (always checks and installs dependencies)
+
 For new modules:
   1. Add your feature to the 'features' array
   2. Create a test method in TestSuite class following the pattern: test[FeatureName]()
@@ -1568,4 +1702,4 @@ For new modules:
 main().catch(err => {
   console.error('Error:', err);
   process.exit(1);
-});
+}); 
