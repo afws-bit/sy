@@ -1265,42 +1265,35 @@ class TestSuite {
     this.assert(!await fileExists(renamedFile), 'unlink removes file');
   }
 
-  async testConfigManagement() {
-    console.log('\n⚙️ Testing Configuration Management...');
+  async testNoExtraFilesCreated() {
+    console.log('\n🔍 Testing No Extra Files Created...');
     
-    const testConfig = {
-      ...DEFAULTS,
-      projectName: 'ConfigTest',
-      installDir: '/tmp/config-test',
-      mainEntryPointSrc: 'test.java',
-      mainEntryPointCmd: 'testcmd',
-      additionalToolSrc: 'tool.py',
-      additionalToolCmd: 'tool'
-    };
+    const config = { ...DEFAULTS, projectName: 'TestNoExtra' };
+    const enabledFeatures = new Set(['onlineinstall', 'onlineforced']);
     
-    await saveConfig(testConfig);
-    const configFile = path.join(process.cwd(), '.shinstallrc');
-    await this.assertFileExists(configFile, 'saveConfig creates .shinstallrc');
+    // Generate install.sh in test directory
+    const testInstallPath = path.join(this.testDir, 'install.sh');
+    const content = generateInstallSh(config, enabledFeatures);
+    await writeFile(testInstallPath, content, 'utf8');
     
-    const loadedConfig = await loadConfig();
+    // Check that only install.sh was created
+    const files = await readdir(this.testDir);
+    const installShFiles = files.filter(f => f === 'install.sh');
+    
     this.assert(
-      loadedConfig.projectName === 'ConfigTest',
-      'loadConfig returns saved configuration'
-    );
-    this.assert(
-      loadedConfig.mainEntryPointSrc === 'test.java',
-      'loadConfig returns correct main entry point'
-    );
-    this.assert(
-      loadedConfig.additionalToolSrc === 'tool.py',
-      'loadConfig returns correct additional tools'
+      installShFiles.length === 1,
+      'Only install.sh file is created'
     );
     
-    try {
-      await unlink(configFile);
-    } catch (e) {
-      // Ignore if file doesn't exist
-    }
+    this.assert(
+      !files.includes('.shfeatures'),
+      'No .shfeatures file is created'
+    );
+    
+    this.assert(
+      !files.includes('shfeatures.json'),
+      'No shfeatures.json file is created'
+    );
   }
 
   async runAllTests() {
@@ -1312,7 +1305,7 @@ class TestSuite {
       await this.testFeatureGeneration();
       await this.testGenerateInstallSh();
       await this.testFileOperations();
-      await this.testConfigManagement();
+      await this.testNoExtraFilesCreated();
       
       await this.testBuildFeature();
       await this.testDebInstallFeature();
@@ -1473,7 +1466,7 @@ async function toggleFeatures() {
     if (num >= 1 && num <= features.length) {
       const id = features[num - 1].id;
       
-      // If trying to disable onlineforced but onlineinstall is still enabled
+      // If trying to disable onlineinstall but onlineforced is still enabled
       if (id === 'onlineinstall' && enabled.has('onlineinstall') && enabled.has('onlineforced')) {
         console.log('Note: Disabling onlineinstall will also disable forced online mode.');
         enabled.delete('onlineforced');
@@ -1517,10 +1510,12 @@ async function configureSettings() {
     additionalToolSrc: toolSrc || '',
     additionalToolCmd: toolCmd || '',
   };
-  await saveConfig(config);
-  console.log('Settings saved to .shinstallrc');
+  
+  console.log('Configuration set for this session.');
   console.log('Language is automatically detected from file extension:');
   console.log('  .js → Node.js | .py → Python | .c → C | .cpp/.cc → C++ | .java → Java | .sh → Shell');
+  
+  return config;
 }
 
 async function generateOldWrapper() {
@@ -1624,19 +1619,6 @@ async function selectFeatures() {
   return enabled;
 }
 
-async function saveConfig(config) {
-  await writeFile('.shinstallrc', JSON.stringify(config, null, 2), 'utf8');
-}
-
-async function loadConfig() {
-  try {
-    const data = await readFile('.shinstallrc', 'utf8');
-    return JSON.parse(data);
-  } catch {
-    return { ...DEFAULTS };
-  }
-}
-
 // ==================== CLI ENTRY POINT ====================
 
 async function main() {
@@ -1668,6 +1650,8 @@ Multi-language support is ALWAYS enabled:
 Features:
   - Online dependency installation (--online flag)
   - Forced online dependency installation (always checks and installs dependencies)
+
+Note: Only install.sh is generated. No additional files are created.
 
 For new modules:
   1. Add your feature to the 'features' array
@@ -1702,4 +1686,4 @@ For new modules:
 main().catch(err => {
   console.error('Error:', err);
   process.exit(1);
-}); 
+});
